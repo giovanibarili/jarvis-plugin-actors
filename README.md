@@ -12,13 +12,23 @@ Ask JARVIS:
 
 ## How it works
 
-The plugin provides 3 pieces that work together via the EventBus.
+The plugin provides 3 pieces that communicate via the typed EventBus channels.
 
-**ActorPoolPiece** manages the pool of actors (create, reuse, kill) and registers 4 tools: `actor_dispatch`, `actor_list`, `actor_kill`, `bus_publish`. When a task is dispatched, it publishes an `actor.dispatch` event on the bus.
+**ActorPoolPiece** manages the pool of actors (create, reuse, kill) and registers lifecycle tools. When a task is dispatched, it publishes an `ai.request` message with `target: "actor-{name}"`. When the actor finishes, the result appears in the main chat with the actor's name as label.
 
-**ActorRunnerPiece** consumes `actor.dispatch` events and runs tasks autonomously. It creates AI sessions via the JARVIS session factory, executes the stream+tool loop (up to 15 rounds), and publishes stream events (`core.actor-{name}.stream.*`) for real-time visibility. Results are published back via `actor.dispatch.result`.
+**ActorRunnerPiece** listens for `ai.request` messages targeting actors. It creates AI sessions via the JARVIS session factory, executes the stream+tool loop (up to 15 rounds), and publishes `ai.stream` events for real-time visibility. Results are reported back via `system.event`.
 
-**ActorChatPiece** registers HTTP routes on the main JARVIS server for direct actor communication: SSE streaming, message sending, and history retrieval.
+**ActorChatPiece** registers HTTP routes on the main JARVIS server for direct actor communication. It listens to `ai.request` and `ai.stream` on the bus to capture conversation history and feed SSE clients.
+
+## Communication
+
+The AI manages actor lifecycle via tools and communicates with actors via the EventBus:
+
+```
+bus_publish(channel="ai.request", target="actor-alice", text="que dia é hoje?")
+```
+
+Actor results appear in the main chat with the actor's name as label (e.g. ALICE in purple).
 
 ## Roles
 
@@ -31,17 +41,22 @@ The plugin provides 3 pieces that work together via the EventBus.
 
 ## Tools
 
-- **actor_dispatch** — send a task to a named actor (creates if new, reuses if existing)
+Lifecycle management:
+
+- **actor_dispatch** — create a new actor and send its first task
 - **actor_list** — list all actors with status, role, task count
 - **actor_kill** — destroy an actor and its session
-- **bus_publish** — publish a message to any bus topic
 
-## HTTP Routes (on main server)
+Communication:
+
+- **bus_publish** — send messages to actors via the EventBus (channel, target, text)
+
+## HTTP Routes (on main server, port 50052)
 
 | Route | Method | Description |
 |-------|--------|-------------|
 | /plugins/actors/{name}/stream | GET | SSE stream of actor messages |
-| /plugins/actors/{name}/send | POST | Send message to actor |
+| /plugins/actors/{name}/send | POST | Send direct message to actor |
 | /plugins/actors/{name}/history | GET | Chat history |
 
 ## License

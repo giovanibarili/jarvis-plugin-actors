@@ -53,7 +53,15 @@ Max actors: ${MAX_ACTORS}. Active: ${actorList || 'none'}.
 Available roles:
 ${roleList}
 
-Tools: actor_dispatch, actor_list, actor_kill, bus_publish`;
+Lifecycle tools:
+- actor_dispatch(name, role, task): create a new actor and send its first task
+- actor_list(): list all actors with status
+- actor_kill(name): destroy an actor
+
+Communication via bus:
+- bus_publish(channel="ai.request", target="actor-{name}", text="...") to send messages to existing actors
+- The actor processes autonomously and the result appears in chat
+- Example: bus_publish(channel="ai.request", target="actor-alice", text="que dia é hoje?")`;
   }
 
   async start(bus: EventBus): Promise<void> {
@@ -104,14 +112,16 @@ Tools: actor_dispatch, actor_list, actor_kill, bus_publish`;
       actor.currentTask = undefined;
       if (result) actor.chatHistory.push({ role: 'actor', text: result });
     }
-    // Publish as ai.stream complete so ChatPiece shows it in main chat
-    this.bus.publish({
-      channel: "ai.stream",
-      source: name,
-      target: "main",
-      event: "complete",
-      text: result,
-    });
+    // Only show result in main chat if it was dispatched from main (not a direct actor message)
+    if (replySessionId === "main" || replySessionId?.startsWith("grpc-")) {
+      this.bus.publish({
+        channel: "ai.stream",
+        source: name,
+        target: replySessionId,
+        event: "complete",
+        text: result,
+      });
+    }
     this.updateHud();
   }
 
