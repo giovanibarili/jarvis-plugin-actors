@@ -46,8 +46,10 @@ export class ActorPoolPiece implements Piece {
       .map(a => `${a.id} (${a.role.id}): ${a.status}, ${a.taskCount} tasks done`)
       .join('; ');
     const roleList = this.roles.map(r => `${r.id}: ${r.description}`).join('\n');
-    return `## Actor Pool
-Delegate tasks to persistent AI actors. Each actor has its own session with memory.
+    return `## Actor Pool — Orchestration Mode
+You are the orchestrator. Do NOT use filesystem tools (bash, grep, read_file, edit_file, etc.) directly — delegate all work to actors.
+Respond directly only for: conversational questions, status checks, things you already know.
+Each actor has its own AI session with persistent memory across tasks.
 Max actors: ${MAX_ACTORS}. Active: ${actorList || 'none'}.
 
 Available roles:
