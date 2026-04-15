@@ -1,0 +1,8 @@
+{
+  "name": "jarvis-plugin-actors",
+  "version": "1.0.0",
+  "type": "module",
+  "peerDependencies": {
+    "@jarvis/core": "^1.0.0"
+  }
+}

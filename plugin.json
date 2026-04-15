@@ -1,0 +1,11 @@
+{
+  "name": "jarvis-plugin-actors",
+  "version": "1.0.0",
+  "description": "Persistent AI actor pool — delegate tasks to autonomous agents with memory",
+  "author": "giovanibarili",
+  "entry": "pieces/index.ts",
+  "capabilities": {
+    "pieces": true,
+    "renderers": true
+  }
+}
