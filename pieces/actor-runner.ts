@@ -4,8 +4,8 @@ import type { ActorRole } from "./types.js";
 import { MAX_TOOL_ROUNDS } from "./types.js";
 
 interface EventBus {
-  publish<T>(topic: string, data: any): void;
-  subscribe<T>(topic: string, handler: (msg: T) => void | Promise<void>): () => void;
+  publish(msg: any): void;
+  subscribe(channel: string, handler: (msg: any) => void | Promise<void>): () => void;
 }
 
 interface Piece {
@@ -42,11 +42,11 @@ export class ActorRunnerPiece implements Piece {
   private bus!: EventBus;
   private ctx: PluginContext;
   private sessions = new Map<string, ActorSession>();
+  private running = new Set<string>();
   private actorSystemPrompt: string;
   private started = false;
   private unsubDispatch?: () => void;
   private unsubKill?: () => void;
-  private unsubDirectMsg?: () => void;
 
   constructor(ctx: PluginContext) {
     this.ctx = ctx;
@@ -68,28 +68,31 @@ export class ActorRunnerPiece implements Piece {
     this.started = true;
     this.bus = bus;
 
-    this.unsubDispatch = this.bus.subscribe("actor.dispatch", (msg: any) => {
-      this.handleDispatch(msg);
+    this.unsubDispatch = this.bus.subscribe("ai.request", (msg: any) => {
+      if (!msg.target?.startsWith("actor-")) return;
+      const name = msg.target.replace("actor-", "");
+      if (msg.data?.role) {
+        // Dispatch from pool — create session if needed
+        this.handleDispatch(msg);
+      } else {
+        // Direct message to actor
+        const as = this.sessions.get(name);
+        if (!as || as.stopped) return;
+        if (msg.source === "actor-pool" || msg.source === name) return;
+        if (this.running.has(name)) return;
+        this.running.add(name);
+        this.runTask(name, msg.text, msg.target).finally(() => this.running.delete(name));
+      }
     });
 
-    this.unsubKill = this.bus.subscribe("actor.kill", (msg: any) => {
-      this.killSession(msg.name);
-    });
-
-    this.unsubDirectMsg = this.bus.subscribe("input.prompt", (msg: any) => {
-      if (!msg.sessionId?.startsWith("actor-")) return;
-      const name = msg.sessionId.replace("actor-", "");
-      const as = this.sessions.get(name);
-      if (!as || as.stopped) return;
-      if (msg.componentId === "actor-pool" || msg.componentId === name) return;
-      this.runTask(name, msg.text, msg.replyTo ?? msg.sessionId);
+    this.unsubKill = this.bus.subscribe("system.event", (msg: any) => {
+      if (msg.event === "actor.kill") this.killSession(msg.data.name);
     });
   }
 
   async stop(): Promise<void> {
     this.unsubDispatch?.();
     this.unsubKill?.();
-    this.unsubDirectMsg?.();
     for (const [, as] of this.sessions) {
       as.stopped = true;
       as.session.close();
@@ -98,9 +101,13 @@ export class ActorRunnerPiece implements Piece {
   }
 
   private handleDispatch(msg: any): void {
-    const { name, role, task, replySessionId } = msg;
+    const name = msg.target.replace("actor-", "");
+    const { role, replySessionId } = msg.data;
+    const task = msg.text;
+    if (this.running.has(name)) return; // already running
+    this.running.add(name);
     this.getOrCreateSession(name, role);
-    this.runTask(name, task, replySessionId);
+    this.runTask(name, task, replySessionId).finally(() => this.running.delete(name));
   }
 
   private getOrCreateSession(name: string, role: ActorRole): ActorSession {
@@ -133,9 +140,11 @@ export class ActorRunnerPiece implements Piece {
           switch (event.type) {
             case "text_delta":
               fullText += event.text ?? "";
-              this.bus.publish(`core.${actorSessionId}.stream.delta`, {
-                sessionId: actorSessionId,
-                componentId: "actor-runner",
+              this.bus.publish({
+                channel: "ai.stream",
+                source: name,
+                target: actorSessionId,
+                event: "delta",
                 text: event.text ?? "",
               });
               break;
@@ -143,10 +152,12 @@ export class ActorRunnerPiece implements Piece {
               if (event.toolUse) toolCalls.push(event.toolUse);
               break;
             case "error":
-              this.bus.publish(`core.${actorSessionId}.error`, {
-                sessionId: actorSessionId,
-                componentId: "actor-runner",
-                error: event.error ?? "Unknown error",
+              this.bus.publish({
+                channel: "ai.stream",
+                source: name,
+                target: actorSessionId,
+                event: "error",
+                text: event.error ?? "Unknown error",
               });
               this.publishResult(name, `Error: ${event.error}`, replySessionId);
               return;
@@ -170,11 +181,13 @@ export class ActorRunnerPiece implements Piece {
         break;
       }
 
-      this.bus.publish(`core.${actorSessionId}.stream.complete`, {
-        sessionId: actorSessionId,
-        componentId: "actor-runner",
-        fullText,
-        usage: { input_tokens: 0, output_tokens: 0 },
+      // Complete event for actor chat
+      this.bus.publish({
+        channel: "ai.stream",
+        source: name,
+        target: actorSessionId,
+        event: "complete",
+        text: fullText,
       });
 
       this.publishResult(name, fullText, replySessionId);
@@ -184,12 +197,11 @@ export class ActorRunnerPiece implements Piece {
   }
 
   private publishResult(name: string, result: string, replySessionId: string): void {
-    this.bus.publish("actor.dispatch.result", {
-      sessionId: "system",
-      componentId: "actor-runner",
-      name,
-      result,
-      replySessionId,
+    this.bus.publish({
+      channel: "system.event",
+      source: "actor-runner",
+      event: "actor.dispatch.result",
+      data: { name, result, replySessionId },
     });
   }
 

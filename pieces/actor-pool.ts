@@ -4,8 +4,8 @@ import type { Actor, ActorRole, ActorDispatchResultEvent } from "./types.js";
 import { BUILT_IN_ROLES, MAX_ACTORS } from "./types.js";
 
 interface EventBus {
-  publish<T>(topic: string, data: any): void;
-  subscribe<T>(topic: string, handler: (msg: T) => void | Promise<void>): () => void;
+  publish(msg: any): void;
+  subscribe(channel: string, handler: (msg: any) => void | Promise<void>): () => void;
 }
 
 interface Piece {
@@ -24,12 +24,6 @@ interface PluginContext {
   sessionFactory: any;
   registerRoute: (method: string, path: string, handler: any) => void;
 }
-
-const HUD_TOPICS = {
-  ADD: "hud.piece.add",
-  UPDATE: "hud.piece.update",
-  REMOVE: "hud.piece.remove",
-} as const;
 
 export class ActorPoolPiece implements Piece {
   readonly id = "actor-pool";
@@ -67,15 +61,17 @@ Tools: actor_dispatch, actor_list, actor_kill, bus_publish`;
     this.started = true;
     this.bus = bus;
 
-    this.unsubDispatchResult = this.bus.subscribe("actor.dispatch.result", (msg: any) => {
-      this.handleDispatchResult(msg);
+    this.unsubDispatchResult = this.bus.subscribe("system.event", (msg: any) => {
+      if (msg.event === "actor.dispatch.result") this.handleDispatchResult(msg);
     });
 
     this.registerTools();
 
-    this.bus.publish(HUD_TOPICS.ADD, {
-      sessionId: "system",
-      componentId: this.id,
+    this.bus.publish({
+      channel: "hud.update",
+      source: this.id,
+      action: "add",
+      pieceId: this.id,
       piece: {
         pieceId: this.id,
         type: "panel",
@@ -91,15 +87,16 @@ Tools: actor_dispatch, actor_list, actor_kill, bus_publish`;
   async stop(): Promise<void> {
     this.unsubDispatchResult?.();
     this.actors.clear();
-    this.bus.publish(HUD_TOPICS.REMOVE, {
-      sessionId: "system",
-      componentId: this.id,
+    this.bus.publish({
+      channel: "hud.update",
+      source: this.id,
+      action: "remove",
       pieceId: this.id,
     });
   }
 
   private handleDispatchResult(msg: any): void {
-    const { name, result, replySessionId } = msg as ActorDispatchResultEvent;
+    const { name, result, replySessionId } = msg.data as ActorDispatchResultEvent;
     const actor = this.actors.get(name);
     if (actor) {
       actor.status = "idle";
@@ -107,9 +104,12 @@ Tools: actor_dispatch, actor_list, actor_kill, bus_publish`;
       actor.currentTask = undefined;
       if (result) actor.chatHistory.push({ role: 'actor', text: result });
     }
-    this.bus.publish("input.prompt", {
-      sessionId: replySessionId,
-      componentId: name,
+    // Publish as ai.stream complete so ChatPiece shows it in main chat
+    this.bus.publish({
+      channel: "ai.stream",
+      source: name,
+      target: "main",
+      event: "complete",
       text: result,
     });
     this.updateHud();
@@ -155,13 +155,12 @@ Tools: actor_dispatch, actor_list, actor_kill, bus_publish`;
         actor.taskCount++;
         this.updateHud();
 
-        this.bus.publish("actor.dispatch", {
-          sessionId: `actor-${name}`,
-          componentId: this.id,
-          name,
-          role: actor.role,
-          task,
-          replySessionId: sessionId,
+        this.bus.publish({
+          channel: "ai.request",
+          source: "jarvis-core",
+          target: "actor-" + name,
+          text: task,
+          data: { name, role: actor.role, replySessionId: sessionId },
         });
 
         return { ok: true, actorId: name };
@@ -198,7 +197,7 @@ Tools: actor_dispatch, actor_list, actor_kill, bus_publish`;
         if (!actor) return { ok: false, error: `Actor not found: ${name}` };
         actor.status = "stopped";
         this.actors.delete(name);
-        this.bus.publish("actor.kill", { sessionId: "system", componentId: this.id, name });
+        this.bus.publish({ channel: "system.event", source: this.id, event: "actor.kill", data: { name } });
         this.updateHud();
         return { ok: true };
       },
@@ -206,23 +205,26 @@ Tools: actor_dispatch, actor_list, actor_kill, bus_publish`;
 
     this.ctx.toolRegistry.register({
       name: "bus_publish",
-      description: "Publish a message to the EventBus. Use to send messages to specific sessions.",
+      description: "Publish a message to the EventBus. Use to send messages to specific targets.",
       input_schema: {
         type: "object",
         properties: {
-          topic: { type: "string", description: "Bus topic (e.g. 'input.prompt')" },
-          session_id: { type: "string", description: "Target session ID" },
+          channel: { type: "string", description: "Bus channel (e.g. 'ai.request', 'system.event')" },
+          target: { type: "string", description: "Target ID (e.g. 'actor-alice', 'main')" },
           text: { type: "string", description: "Message text" },
         },
-        required: ["topic", "session_id", "text"],
+        required: ["channel", "target", "text"],
       },
       handler: async (input: any) => {
         const caller = input.__sessionId ? String(input.__sessionId) : "unknown";
         const source = caller.startsWith("actor-") ? caller.replace("actor-", "") : "jarvis";
-        this.bus.publish(String(input.topic), {
-          sessionId: String(input.session_id),
-          componentId: source,
-          text: String(input.text),
+        const { channel, target, text, ...rest } = input;
+        this.bus.publish({
+          channel: String(channel) as any,
+          source,
+          target: String(target),
+          text: String(text),
+          ...rest,
         });
         return { ok: true };
       },
@@ -241,9 +243,10 @@ Tools: actor_dispatch, actor_list, actor_kill, bus_publish`;
   }
 
   private updateHud(): void {
-    this.bus.publish(HUD_TOPICS.UPDATE, {
-      sessionId: "system",
-      componentId: this.id,
+    this.bus.publish({
+      channel: "hud.update",
+      source: this.id,
+      action: "update",
       pieceId: this.id,
       data: this.getData(),
       status: [...this.actors.values()].some(a => a.status === "running") ? "processing" : "running",

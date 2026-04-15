@@ -1,8 +1,8 @@
 import { MAX_CHAT_HISTORY } from "./types.js";
 
 interface EventBus {
-  publish<T>(topic: string, data: any): void;
-  subscribe<T>(topic: string, handler: (msg: T) => void | Promise<void>): () => void;
+  publish(msg: any): void;
+  subscribe(channel: string, handler: (msg: any) => void | Promise<void>): () => void;
 }
 
 interface Piece {
@@ -42,6 +42,20 @@ export class ActorChatPiece implements Piece {
 
     this.ctx.registerRoute("GET", "/plugins/actors/", (req: any, res: any) => this.handleGet(req, res));
     this.ctx.registerRoute("POST", "/plugins/actors/", (req: any, res: any) => this.handlePost(req, res));
+
+    // Auto-subscribe to actor streams when a request targets an actor
+    this.unsubscribes.push(
+      this.bus.subscribe("ai.request", (msg: any) => {
+        if (!msg.target?.startsWith("actor-")) return;
+        if (msg.source === "actor-chat") return; // ignore our own sends
+        const name = msg.target.replace("actor-", "");
+        this.ensureSubscribed(name);
+        const source = msg.source ?? "unknown";
+        const history = this.getHistory(name);
+        history.push({ role: 'user', text: msg.text, source });
+        this.broadcast(name, { type: "user", text: msg.text, source });
+      })
+    );
   }
 
   async stop(): Promise<void> {
@@ -57,26 +71,26 @@ export class ActorChatPiece implements Piece {
     if (this.subscribedActors.has(actorName)) return;
     this.subscribedActors.add(actorName);
 
-    const sessionId = `actor-${actorName}`;
+    const target = `actor-${actorName}`;
 
     this.unsubscribes.push(
-      this.bus.subscribe(`core.${sessionId}.stream.delta`, (msg: any) => {
-        this.broadcast(actorName, { type: "delta", text: msg.text });
-      })
-    );
-
-    this.unsubscribes.push(
-      this.bus.subscribe(`core.${sessionId}.stream.complete`, (msg: any) => {
-        const history = this.getHistory(actorName);
-        history.push({ role: 'actor', text: msg.fullText });
-        if (history.length > MAX_CHAT_HISTORY) history.splice(0, history.length - MAX_CHAT_HISTORY);
-        this.broadcast(actorName, { type: "done", fullText: msg.fullText });
-      })
-    );
-
-    this.unsubscribes.push(
-      this.bus.subscribe(`core.${sessionId}.error`, (msg: any) => {
-        this.broadcast(actorName, { type: "error", error: msg.error });
+      this.bus.subscribe("ai.stream", (msg: any) => {
+        if (msg.target !== target) return;
+        switch (msg.event) {
+          case "delta":
+            this.broadcast(actorName, { type: "delta", text: msg.text });
+            break;
+          case "complete": {
+            const history = this.getHistory(actorName);
+            history.push({ role: 'actor', text: msg.text });
+            if (history.length > MAX_CHAT_HISTORY) history.splice(0, history.length - MAX_CHAT_HISTORY);
+            this.broadcast(actorName, { type: "done", fullText: msg.text });
+            break;
+          }
+          case "error":
+            this.broadcast(actorName, { type: "error", error: msg.text });
+            break;
+        }
       })
     );
   }
@@ -143,9 +157,10 @@ export class ActorChatPiece implements Piece {
         this.broadcast(actorName, { type: "user", text, source: "you" });
         this.ensureSubscribed(actorName);
 
-        this.bus.publish("input.prompt", {
-          sessionId: `actor-${actorName}`,
-          componentId: "actor-chat",
+        this.bus.publish({
+          channel: "ai.request",
+          source: "user",
+          target: "actor-" + actorName,
           text,
         });
 
