@@ -59,8 +59,8 @@ export class ActorRunnerPiece implements Piece {
     return "You are an autonomous worker agent. Execute tasks using available tools. Report results clearly.";
   }
 
-  private buildActorPrompt(role: ActorRole): string {
-    return `${this.actorSystemPrompt}\n\n---\n\n## Your Role: ${role.name}\n\n${role.systemPrompt}`;
+  private buildRoleContext(role: ActorRole): string {
+    return `## Your Role: ${role.name}\n\n${role.systemPrompt}`;
   }
 
   async start(bus: EventBus): Promise<void> {
@@ -114,8 +114,11 @@ export class ActorRunnerPiece implements Piece {
     let as = this.sessions.get(name);
     if (as && !as.stopped) return as;
 
-    const prompt = this.buildActorPrompt(role);
-    const session = this.ctx.sessionFactory.createWithPrompt(prompt, { label: `actor-${name}` });
+    const session = this.ctx.sessionFactory.createWithPrompt({
+      label: `actor-${name}`,
+      basePromptOverride: this.actorSystemPrompt,
+      roleContext: this.buildRoleContext(role),
+    });
     as = { session, stopped: false };
     this.sessions.set(name, as);
     return as;

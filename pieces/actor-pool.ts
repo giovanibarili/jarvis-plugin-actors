@@ -1,5 +1,5 @@
-import { readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { join, basename } from "node:path";
 import type { Actor, ActorRole, ActorDispatchResultEvent } from "./types.js";
 import { BUILT_IN_ROLES, MAX_ACTORS } from "./types.js";
 
@@ -36,9 +36,59 @@ export class ActorPoolPiece implements Piece {
   private started = false;
   private unsubDispatchResult?: () => void;
 
+  private static readonly ROLES_DIR = join(process.env.HOME ?? "~", ".jarvis", "roles");
+
   constructor(ctx: PluginContext) {
     this.ctx = ctx;
-    this.roles = [...BUILT_IN_ROLES];
+    this.roles = this.loadRoles();
+  }
+
+  /**
+   * Load roles from ~/.jarvis/roles/*.md files.
+   * Falls back to BUILT_IN_ROLES if directory doesn't exist or is empty.
+   * File format: YAML frontmatter (name, description) + body (system prompt).
+   * Role ID = filename without extension.
+   */
+  private loadRoles(): ActorRole[] {
+    const dir = ActorPoolPiece.ROLES_DIR;
+    if (!existsSync(dir)) return [...BUILT_IN_ROLES];
+
+    const files = readdirSync(dir).filter(f => f.endsWith(".md"));
+    if (files.length === 0) return [...BUILT_IN_ROLES];
+
+    const roles: ActorRole[] = [];
+    for (const file of files) {
+      try {
+        const content = readFileSync(join(dir, file), "utf-8");
+        const role = this.parseRoleFile(file, content);
+        if (role) roles.push(role);
+      } catch {
+        // skip malformed files
+      }
+    }
+
+    return roles.length > 0 ? roles : [...BUILT_IN_ROLES];
+  }
+
+  private parseRoleFile(filename: string, content: string): ActorRole | null {
+    // Extract YAML frontmatter between --- markers
+    const match = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+    if (!match) return null;
+
+    const frontmatter = match[1];
+    const body = match[2].trim();
+
+    const nameMatch = frontmatter.match(/^name:\s*(.+)$/m);
+    const descMatch = frontmatter.match(/^description:\s*(.+)$/m);
+
+    if (!nameMatch || !descMatch || !body) return null;
+
+    return {
+      id: basename(filename, ".md"),
+      name: nameMatch[1].trim(),
+      description: descMatch[1].trim(),
+      systemPrompt: body,
+    };
   }
 
   systemContext(): string {
@@ -140,6 +190,7 @@ Communication via bus:
   }
 
   private registerCapabilities(): void {
+    const roleIds = this.roles.map(r => r.id).join(", ");
     this.ctx.capabilityRegistry.register({
       name: "actor_dispatch",
       description: "Send a task to a named actor. If the actor exists, reuses its session (keeps memory). If new, creates one. The actor runs autonomously and reports back when done.",
@@ -147,7 +198,7 @@ Communication via bus:
         type: "object",
         properties: {
           name: { type: "string", description: "Actor name (e.g. 'alice', 'bob'). Same name = same session." },
-          role: { type: "string", description: "Role for new actors: generic, researcher, coder, reviewer." },
+          role: { type: "string", description: `Role for new actors: ${roleIds}.` },
           task: { type: "string", description: "The task description" },
         },
         required: ["name", "role", "task"],
