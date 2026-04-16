@@ -90,6 +90,18 @@ export class ActorChatPiece implements Piece {
           case "error":
             this.broadcast(actorName, { type: "error", error: msg.text });
             break;
+          case "tool_start":
+            this.broadcast(actorName, { type: "tool_start", name: msg.toolName, id: msg.toolId, args: msg.toolArgs });
+            break;
+          case "tool_done":
+            this.broadcast(actorName, { type: "tool_done", name: msg.toolName, id: msg.toolId, ms: msg.toolMs, output: msg.toolOutput });
+            break;
+          case "tool_cancelled":
+            this.broadcast(actorName, { type: "tool_cancelled", name: msg.toolName, id: msg.toolId });
+            break;
+          case "aborted":
+            this.broadcast(actorName, { type: "aborted" });
+            break;
         }
       })
     );
