@@ -1,7 +1,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import type { ActorRole } from "./types.js";
-import { MAX_TOOL_ROUNDS } from "./types.js";
+import { MAX_CAPABILITY_ROUNDS } from "./types.js";
 
 interface EventBus {
   publish(msg: any): void;
@@ -17,7 +17,7 @@ interface Piece {
 
 interface PluginContext {
   bus: EventBus;
-  toolRegistry: any;
+  capabilityRegistry: any;
   pluginDir: string;
   sessionFactory: any;
 }
@@ -127,12 +127,12 @@ export class ActorRunnerPiece implements Piece {
 
     const actorSessionId = `actor-${name}`;
     let fullText = "";
-    let toolRounds = 0;
+    let capabilityRounds = 0;
     let stream = as.session.sendAndStream(task);
 
     try {
       while (true) {
-        const toolCalls: any[] = [];
+        const capabilityCalls: any[] = [];
         fullText = "";
 
         for await (const event of stream) {
@@ -149,7 +149,7 @@ export class ActorRunnerPiece implements Piece {
               });
               break;
             case "tool_use":
-              if (event.toolUse) toolCalls.push(event.toolUse);
+              if (event.toolUse) capabilityCalls.push(event.toolUse);
               break;
             case "error":
               this.bus.publish({
@@ -166,14 +166,14 @@ export class ActorRunnerPiece implements Piece {
 
         if (as.stopped) return;
 
-        if (toolCalls.length > 0) {
-          toolRounds++;
-          if (toolRounds > MAX_TOOL_ROUNDS) {
-            fullText += "\n\n[Max tool rounds reached. Stopping.]";
+        if (capabilityCalls.length > 0) {
+          capabilityRounds++;
+          if (capabilityRounds > MAX_CAPABILITY_ROUNDS) {
+            fullText += "\n\n[Max capability rounds reached. Stopping.]";
             break;
           }
-          const results = await this.ctx.toolRegistry.execute(toolCalls);
-          as.session.addToolResults(toolCalls, results);
+          const results = await this.ctx.capabilityRegistry.execute(capabilityCalls);
+          as.session.addToolResults(capabilityCalls, results);
           stream = as.session.continueAndStream();
           continue;
         }

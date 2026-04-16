@@ -18,7 +18,7 @@ interface Piece {
 
 interface PluginContext {
   bus: EventBus;
-  toolRegistry: any;
+  capabilityRegistry: any;
   config: Record<string, unknown>;
   pluginDir: string;
   sessionFactory: any;
@@ -75,7 +75,7 @@ Communication via bus:
       if (msg.event === "actor.dispatch.result") this.handleDispatchResult(msg);
     });
 
-    this.registerTools();
+    this.registerCapabilities();
 
     this.bus.publish({
       channel: "hud.update",
@@ -127,8 +127,8 @@ Communication via bus:
     this.updateHud();
   }
 
-  private registerTools(): void {
-    this.ctx.toolRegistry.register({
+  private registerCapabilities(): void {
+    this.ctx.capabilityRegistry.register({
       name: "actor_dispatch",
       description: "Send a task to a named actor. If the actor exists, reuses its session (keeps memory). If new, creates one. The actor runs autonomously and reports back when done.",
       input_schema: {
@@ -179,7 +179,7 @@ Communication via bus:
       },
     });
 
-    this.ctx.toolRegistry.register({
+    this.ctx.capabilityRegistry.register({
       name: "actor_list",
       description: "List all actors in the pool with their status, role, and task count.",
       input_schema: { type: "object", properties: {} },
@@ -195,7 +195,7 @@ Communication via bus:
       }),
     });
 
-    this.ctx.toolRegistry.register({
+    this.ctx.capabilityRegistry.register({
       name: "actor_kill",
       description: "Kill an actor and destroy its session.",
       input_schema: {
@@ -215,7 +215,7 @@ Communication via bus:
       },
     });
 
-    this.ctx.toolRegistry.register({
+    this.ctx.capabilityRegistry.register({
       name: "bus_publish",
       description: "Publish a message to the EventBus. Use to send messages to specific targets.",
       input_schema: {

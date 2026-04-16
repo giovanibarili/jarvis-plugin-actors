@@ -60,5 +60,5 @@ export const BUILT_IN_ROLES: ActorRole[] = [
 ];
 
 export const MAX_ACTORS = 5;
-export const MAX_TOOL_ROUNDS = 15;
+export const MAX_CAPABILITY_ROUNDS = 15;
 export const MAX_CHAT_HISTORY = 500;

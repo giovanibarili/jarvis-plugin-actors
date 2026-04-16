@@ -4,7 +4,7 @@ import { ActorChatPiece } from "./actor-chat.js";
 
 interface PluginContext {
   bus: any;
-  toolRegistry: any;
+  capabilityRegistry: any;
   config: Record<string, unknown>;
   pluginDir: string;
   sessionFactory: any;
