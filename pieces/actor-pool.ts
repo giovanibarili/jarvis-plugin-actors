@@ -73,6 +73,18 @@ Communication via bus:
 
     this.unsubDispatchResult = this.bus.subscribe("system.event", (msg: any) => {
       if (msg.event === "actor.dispatch.result") this.handleDispatchResult(msg);
+      if (msg.event === "actor.kill.request") {
+        const name = msg.data?.name;
+        if (name) {
+          const actor = this.actors.get(name);
+          if (actor) {
+            actor.status = "stopped";
+            this.actors.delete(name);
+            this.bus.publish({ channel: "system.event", source: this.id, event: "actor.kill", data: { name } });
+            this.updateHud();
+          }
+        }
+      }
     });
 
     this.registerCapabilities();

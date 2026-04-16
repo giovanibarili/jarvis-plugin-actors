@@ -120,7 +120,7 @@ export class ActorChatPiece implements Piece {
   }
 
   private parseUrl(url: string): { actorName: string; action: string } | null {
-    const match = url?.match(/^\/plugins\/actors\/([^/]+)\/(send|stream|history)$/);
+    const match = url?.match(/^\/plugins\/actors\/([^/]+)\/(send|stream|history|kill)$/);
     if (!match) return null;
     return { actorName: match[1], action: match[2] };
   }
@@ -156,7 +156,30 @@ export class ActorChatPiece implements Piece {
 
   private handlePost(req: any, res: any): void {
     const parsed = this.parseUrl(req.url);
-    if (!parsed || parsed.action !== "send") { res.writeHead(404); res.end(); return; }
+    if (!parsed) { res.writeHead(404); res.end(); return; }
+
+    if (parsed.action === "kill") {
+      const { actorName } = parsed;
+      // Kill via bus event (same as actor_kill capability)
+      this.bus.publish({
+        channel: "system.event",
+        source: "actor-chat",
+        event: "actor.kill.request",
+        data: { name: actorName },
+      });
+      // Notify main chat
+      this.bus.publish({
+        channel: "ai.request",
+        source: "system",
+        target: "main",
+        text: `[SYSTEM] Actor "${actorName}" was manually killed from the HUD.`,
+      });
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    if (parsed.action !== "send") { res.writeHead(404); res.end(); return; }
 
     const { actorName } = parsed;
     let body = "";
