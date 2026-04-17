@@ -27,6 +27,7 @@ interface AISession {
   sendAndStream(prompt: string): AsyncGenerator<any, void>;
   addToolResults(toolCalls: any[], results: any[]): void;
   continueAndStream(): AsyncGenerator<any, void>;
+  abort(): void;
   close(): void;
 }
 
@@ -87,6 +88,7 @@ export class ActorRunnerPiece implements Piece {
 
     this.unsubKill = this.bus.subscribe("system.event", (msg: any) => {
       if (msg.event === "actor.kill") this.killSession(msg.data.name);
+      if (msg.event === "actor.abort.request") this.abortSession(msg.data.name);
     });
   }
 
@@ -98,6 +100,18 @@ export class ActorRunnerPiece implements Piece {
       as.session.close();
     }
     this.sessions.clear();
+  }
+
+  private abortSession(name: string): void {
+    const as = this.sessions.get(name);
+    if (!as || as.stopped) return;
+    as.session.abort();
+    this.bus.publish({
+      channel: "ai.stream",
+      source: name,
+      target: `actor-${name}`,
+      event: "aborted",
+    });
   }
 
   private handleDispatch(msg: any): void {
@@ -171,11 +185,38 @@ export class ActorRunnerPiece implements Piece {
 
         if (capabilityCalls.length > 0) {
           capabilityRounds++;
-          if (capabilityRounds > MAX_CAPABILITY_ROUNDS) {
-            fullText += "\n\n[Max capability rounds reached. Stopping.]";
-            break;
+
+          // Emit tool_start for each capability
+          for (const call of capabilityCalls) {
+            this.bus.publish({
+              channel: "ai.stream",
+              source: name,
+              target: actorSessionId,
+              event: "tool_start",
+              toolName: call.name,
+              toolId: call.id,
+              toolArgs: typeof call.input === "string" ? call.input : JSON.stringify(call.input).slice(0, 300),
+            });
           }
+
           const results = await this.ctx.capabilityRegistry.execute(capabilityCalls);
+
+          // Emit tool_done for each capability
+          for (let i = 0; i < capabilityCalls.length; i++) {
+            const call = capabilityCalls[i];
+            const result = results[i];
+            const output = typeof result?.content === "string" ? result.content.slice(0, 300) : JSON.stringify(result).slice(0, 300);
+            this.bus.publish({
+              channel: "ai.stream",
+              source: name,
+              target: actorSessionId,
+              event: "tool_done",
+              toolName: call.name,
+              toolId: call.id,
+              toolOutput: output,
+            });
+          }
+
           as.session.addToolResults(capabilityCalls, results);
           stream = as.session.continueAndStream();
           continue;

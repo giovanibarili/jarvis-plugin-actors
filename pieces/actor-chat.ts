@@ -120,7 +120,7 @@ export class ActorChatPiece implements Piece {
   }
 
   private parseUrl(url: string): { actorName: string; action: string } | null {
-    const match = url?.match(/^\/plugins\/actors\/([^/]+)\/(send|stream|history|kill)$/);
+    const match = url?.match(/^\/plugins\/actors\/([^/]+)\/(send|stream|history|kill|abort)$/);
     if (!match) return null;
     return { actorName: match[1], action: match[2] };
   }
@@ -157,6 +157,19 @@ export class ActorChatPiece implements Piece {
   private handlePost(req: any, res: any): void {
     const parsed = this.parseUrl(req.url);
     if (!parsed) { res.writeHead(404); res.end(); return; }
+
+    if (parsed.action === "abort") {
+      const { actorName } = parsed;
+      this.bus.publish({
+        channel: "system.event",
+        source: "actor-chat",
+        event: "actor.abort.request",
+        data: { name: actorName },
+      });
+      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
 
     if (parsed.action === "kill") {
       const { actorName } = parsed;
