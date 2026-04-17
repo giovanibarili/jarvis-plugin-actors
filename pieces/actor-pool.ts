@@ -292,17 +292,18 @@ export class ActorPoolPiece implements Piece {
     this.ctx.capabilityRegistry.register({
       name: "bus_publish",
       description: "Publish a message to the EventBus. Use to send messages to specific targets.\n\n"
-        + "Fire-and-forget (default): omit reply_to or set it to false. The message is delivered but "
+        + "Fire-and-forget (default): omit reply_to. The message is delivered but "
         + "no response comes back to you. Use for notifications, one-way commands, or when you don't need an answer.\n\n"
-        + "Request-reply: set reply_to=true. The target will automatically route its response back to your session "
-        + "once it finishes processing. Use when you ask a question or need the result of a task.",
+        + "Request-reply: set reply_to to a session ID (e.g. 'actor-alice', 'main'). The target will route its response "
+        + "to that session once it finishes processing. Use when you ask a question or need the result of a task. "
+        + "Typically set reply_to to your own session ID so the answer comes back to you.",
       input_schema: {
         type: "object",
         properties: {
           channel: { type: "string", description: "Bus channel (e.g. 'ai.request', 'system.event')" },
           target: { type: "string", description: "Target ID (e.g. 'actor-alice', 'main')" },
           text: { type: "string", description: "Message text" },
-          reply_to: { type: "boolean", description: "Set to true to receive the target's response back in your session. Default: false (fire-and-forget)." },
+          reply_to: { type: "string", description: "Session ID to route the response to (e.g. 'actor-alice', 'main'). Omit for fire-and-forget." },
         },
         required: ["channel", "target", "text"],
       },
@@ -312,14 +313,8 @@ export class ActorPoolPiece implements Piece {
         const channel = String(input.channel);
         const target = String(input.target);
         const text = String(input.text);
-        const wantsReply = !!input.reply_to;
-        // Set replyTo only when explicitly requested
-        let replyTo: string | undefined;
-        if (wantsReply) {
-          replyTo = caller.startsWith("actor-") ? caller
-            : caller === "main" ? "main"
-            : undefined;
-        }
+        // reply_to is a session ID string — pass it directly as replyTo
+        const replyTo = input.reply_to ? String(input.reply_to) : undefined;
         this.bus.publish({
           channel: channel as "ai.request",
           source,
