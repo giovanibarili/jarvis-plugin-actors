@@ -207,7 +207,12 @@ export class ActorRunnerPiece implements Piece {
             });
           }
 
-          const results: CapabilityResult[] = await this.ctx.capabilityRegistry.execute(capabilityCalls);
+          // Inject sessionId so capabilities (like skill_invoke) know the calling actor
+          const enrichedCalls = capabilityCalls.map(c => ({
+            ...c,
+            input: { ...(c.input as Record<string, unknown>), __sessionId: actorSessionId },
+          }));
+          const results: CapabilityResult[] = await this.ctx.capabilityRegistry.execute(enrichedCalls);
 
           for (let i = 0; i < capabilityCalls.length; i++) {
             const call = capabilityCalls[i];
