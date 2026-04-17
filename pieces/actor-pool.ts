@@ -77,23 +77,24 @@ export class ActorPoolPiece implements Piece {
   }
 
   systemContext(): string {
-    const actorList = [...this.actors.values()]
-      .map(a => `${a.id} (${a.role.id}): ${a.status}, ${a.taskCount} tasks done`)
-      .join('; ');
-    const roleList = this.roles.map(r => `${r.id}: ${r.description}`).join('\n');
-    return `## Actor Pool — Orchestration Mode
+    const parts: string[] = [];
 
-You are the orchestrator. Delegate all filesystem operations, development tasks, research, searches, and complex tool executions to actors via \`actor_dispatch\`. Respond directly only for: conversational questions, status checks, knowledge you already have, and quick lookups.
+    // Active actors (dynamic state)
+    const actorEntries = [...this.actors.values()];
+    if (actorEntries.length > 0) {
+      const actorList = actorEntries
+        .map(a => `- ${a.id} (${a.role.id}): ${a.status}, ${a.taskCount} tasks done`)
+        .join('\n');
+      parts.push(`### Active Actors\n${actorList}`);
+    }
 
-Each actor has its own AI session with persistent memory across tasks. Max ${MAX_ACTORS} actors.
+    // Available roles (dynamic — loaded from ~/.jarvis/roles/)
+    if (this.roles.length > 0) {
+      const roleList = this.roles.map(r => `- ${r.id}: ${r.description}`).join('\n');
+      parts.push(`### Available Roles\n${roleList}`);
+    }
 
-Lifecycle:
-- \`actor_dispatch(name, role, task)\` — create or reuse an actor and send a task
-- \`actor_list()\` — list all actors with status
-- \`actor_kill(name)\` — destroy an actor
-
-Communication via bus:
-- \`bus_publish(channel="ai.request", target="actor-{name}", text="...")\` — send follow-up messages to existing actors`;
+    return parts.length > 0 ? parts.join('\n\n') : '';
   }
 
   async start(bus: EventBus): Promise<void> {
