@@ -1,23 +1,19 @@
 import { MAX_CHAT_HISTORY } from "./types.js";
+import type {
+  Piece,
+  PluginContext,
+  AIRequestMessage,
+  AIStreamMessage,
+  EventBus,
+  RouteHandler,
+} from "@jarvis/core";
+import type { IncomingMessage, ServerResponse } from "node:http";
 
-interface EventBus {
-  publish(msg: any): void;
-  subscribe(channel: string, handler: (msg: any) => void | Promise<void>): () => void;
+interface ChatEntry {
+  role: string;
+  text: string;
+  source?: string;
 }
-
-interface Piece {
-  readonly id: string;
-  readonly name: string;
-  start(bus: EventBus): Promise<void>;
-  stop(): Promise<void>;
-}
-
-interface PluginContext {
-  bus: EventBus;
-  registerRoute: (method: string, path: string, handler: any) => void;
-}
-
-type ServerResponse = import("node:http").ServerResponse;
 
 export class ActorChatPiece implements Piece {
   readonly id = "actor-chat";
@@ -26,7 +22,7 @@ export class ActorChatPiece implements Piece {
   private bus!: EventBus;
   private ctx: PluginContext;
   private started = false;
-  private chatHistories = new Map<string, Array<{ role: string; text: string; source?: string }>>();
+  private chatHistories = new Map<string, ChatEntry[]>();
   private sseClients = new Map<string, Set<ServerResponse>>();
   private unsubscribes: Array<() => void> = [];
   private subscribedActors = new Set<string>();
@@ -40,12 +36,12 @@ export class ActorChatPiece implements Piece {
     this.started = true;
     this.bus = bus;
 
-    this.ctx.registerRoute("GET", "/plugins/actors/", (req: any, res: any) => this.handleGet(req, res));
-    this.ctx.registerRoute("POST", "/plugins/actors/", (req: any, res: any) => this.handlePost(req, res));
+    this.ctx.registerRoute("GET", "/plugins/actors/", ((req: IncomingMessage, res: ServerResponse) => this.handleGet(req, res)) as RouteHandler);
+    this.ctx.registerRoute("POST", "/plugins/actors/", ((req: IncomingMessage, res: ServerResponse) => this.handlePost(req, res)) as RouteHandler);
 
     // Auto-subscribe to actor streams when a request targets an actor
     this.unsubscribes.push(
-      this.bus.subscribe("ai.request", (msg: any) => {
+      this.bus.subscribe<AIRequestMessage>("ai.request", (msg) => {
         if (!msg.target?.startsWith("actor-")) return;
         if (msg.source === "actor-chat") return; // ignore our own sends
         const name = msg.target.replace("actor-", "");
@@ -74,7 +70,7 @@ export class ActorChatPiece implements Piece {
     const target = `actor-${actorName}`;
 
     this.unsubscribes.push(
-      this.bus.subscribe("ai.stream", (msg: any) => {
+      this.bus.subscribe<AIStreamMessage>("ai.stream", (msg) => {
         if (msg.target !== target) return;
         switch (msg.event) {
           case "delta":
@@ -82,7 +78,7 @@ export class ActorChatPiece implements Piece {
             break;
           case "complete": {
             const history = this.getHistory(actorName);
-            history.push({ role: 'actor', text: msg.text });
+            history.push({ role: 'actor', text: msg.text ?? "" });
             if (history.length > MAX_CHAT_HISTORY) history.splice(0, history.length - MAX_CHAT_HISTORY);
             this.broadcast(actorName, { type: "done", fullText: msg.text });
             break;
@@ -107,12 +103,12 @@ export class ActorChatPiece implements Piece {
     );
   }
 
-  private getHistory(name: string) {
+  private getHistory(name: string): ChatEntry[] {
     if (!this.chatHistories.has(name)) this.chatHistories.set(name, []);
     return this.chatHistories.get(name)!;
   }
 
-  private broadcast(actorName: string, data: any): void {
+  private broadcast(actorName: string, data: Record<string, unknown>): void {
     const clients = this.sseClients.get(actorName);
     if (!clients) return;
     const msg = `data: ${JSON.stringify(data)}\n\n`;
@@ -125,8 +121,8 @@ export class ActorChatPiece implements Piece {
     return { actorName: match[1], action: match[2] };
   }
 
-  private handleGet(req: any, res: any): void {
-    const parsed = this.parseUrl(req.url);
+  private handleGet(req: IncomingMessage, res: ServerResponse): void {
+    const parsed = this.parseUrl(req.url ?? "");
     if (!parsed) { res.writeHead(404); res.end(); return; }
 
     const { actorName, action } = parsed;
@@ -154,8 +150,8 @@ export class ActorChatPiece implements Piece {
     res.writeHead(404); res.end();
   }
 
-  private handlePost(req: any, res: any): void {
-    const parsed = this.parseUrl(req.url);
+  private handlePost(req: IncomingMessage, res: ServerResponse): void {
+    const parsed = this.parseUrl(req.url ?? "");
     if (!parsed) { res.writeHead(404); res.end(); return; }
 
     if (parsed.action === "abort") {
@@ -173,14 +169,12 @@ export class ActorChatPiece implements Piece {
 
     if (parsed.action === "kill") {
       const { actorName } = parsed;
-      // Kill via bus event (same as actor_kill capability)
       this.bus.publish({
         channel: "system.event",
         source: "actor-chat",
         event: "actor.kill.request",
         data: { name: actorName },
       });
-      // Notify main chat
       this.bus.publish({
         channel: "ai.request",
         source: "system",
@@ -196,10 +190,10 @@ export class ActorChatPiece implements Piece {
 
     const { actorName } = parsed;
     let body = "";
-    req.on("data", (chunk: string) => { body += chunk; });
+    req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
     req.on("end", () => {
       try {
-        const { text } = JSON.parse(body);
+        const { text } = JSON.parse(body) as { text: string };
         const history = this.getHistory(actorName);
         history.push({ role: 'user', text, source: 'you' });
         this.broadcast(actorName, { type: "user", text, source: "you" });

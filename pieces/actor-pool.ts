@@ -2,28 +2,14 @@ import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join, basename } from "node:path";
 import type { Actor, ActorRole, ActorDispatchResultEvent } from "./types.js";
 import { BUILT_IN_ROLES, MAX_ACTORS } from "./types.js";
-
-interface EventBus {
-  publish(msg: any): void;
-  subscribe(channel: string, handler: (msg: any) => void | Promise<void>): () => void;
-}
-
-interface Piece {
-  readonly id: string;
-  readonly name: string;
-  start(bus: EventBus): Promise<void>;
-  stop(): Promise<void>;
-  systemContext?(): string;
-}
-
-interface PluginContext {
-  bus: EventBus;
-  capabilityRegistry: any;
-  config: Record<string, unknown>;
-  pluginDir: string;
-  sessionFactory: any;
-  registerRoute: (method: string, path: string, handler: any) => void;
-}
+import type {
+  Piece,
+  PluginContext,
+  SystemEventMessage,
+  CapabilityDefinition,
+  CapabilityHandler,
+  EventBus,
+} from "@jarvis/core";
 
 export class ActorPoolPiece implements Piece {
   readonly id = "actor-pool";
@@ -71,7 +57,6 @@ export class ActorPoolPiece implements Piece {
   }
 
   private parseRoleFile(filename: string, content: string): ActorRole | null {
-    // Extract YAML frontmatter between --- markers
     const match = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
     if (!match) return null;
 
@@ -97,23 +82,18 @@ export class ActorPoolPiece implements Piece {
       .join('; ');
     const roleList = this.roles.map(r => `${r.id}: ${r.description}`).join('\n');
     return `## Actor Pool — Orchestration Mode
-You are the orchestrator. Do NOT use filesystem tools (bash, grep, read_file, edit_file, etc.) directly — delegate all work to actors.
-Respond directly only for: conversational questions, status checks, things you already know.
-Each actor has its own AI session with persistent memory across tasks.
-Max actors: ${MAX_ACTORS}. Active: ${actorList || 'none'}.
 
-Available roles:
-${roleList}
+You are the orchestrator. Delegate all filesystem operations, development tasks, research, searches, and complex tool executions to actors via \`actor_dispatch\`. Respond directly only for: conversational questions, status checks, knowledge you already have, and quick lookups.
 
-Lifecycle tools:
-- actor_dispatch(name, role, task): create a new actor and send its first task
-- actor_list(): list all actors with status
-- actor_kill(name): destroy an actor
+Each actor has its own AI session with persistent memory across tasks. Max ${MAX_ACTORS} actors.
+
+Lifecycle:
+- \`actor_dispatch(name, role, task)\` — create or reuse an actor and send a task
+- \`actor_list()\` — list all actors with status
+- \`actor_kill(name)\` — destroy an actor
 
 Communication via bus:
-- bus_publish(channel="ai.request", target="actor-{name}", text="...") to send messages to existing actors
-- The actor processes autonomously and the result appears in chat
-- Example: bus_publish(channel="ai.request", target="actor-alice", text="que dia é hoje?")`;
+- \`bus_publish(channel="ai.request", target="actor-{name}", text="...")\` — send follow-up messages to existing actors`;
   }
 
   async start(bus: EventBus): Promise<void> {
@@ -121,10 +101,10 @@ Communication via bus:
     this.started = true;
     this.bus = bus;
 
-    this.unsubDispatchResult = this.bus.subscribe("system.event", (msg: any) => {
+    this.unsubDispatchResult = this.bus.subscribe<SystemEventMessage>("system.event", (msg) => {
       if (msg.event === "actor.dispatch.result") this.handleDispatchResult(msg);
       if (msg.event === "actor.kill.request") {
-        const name = msg.data?.name;
+        const name = msg.data?.name as string | undefined;
         if (name) {
           const actor = this.actors.get(name);
           if (actor) {
@@ -167,8 +147,8 @@ Communication via bus:
     });
   }
 
-  private handleDispatchResult(msg: any): void {
-    const { name, result, replySessionId } = msg.data as ActorDispatchResultEvent;
+  private handleDispatchResult(msg: SystemEventMessage): void {
+    const { name, result } = msg.data as unknown as ActorDispatchResultEvent;
     const actor = this.actors.get(name);
     if (actor) {
       actor.status = "idle";
@@ -176,21 +156,14 @@ Communication via bus:
       actor.currentTask = undefined;
       if (result) actor.chatHistory.push({ role: 'actor', text: result });
     }
-    // Only show result in main chat if it was dispatched from main (not a direct actor message)
-    if (replySessionId === "main" || replySessionId?.startsWith("grpc-")) {
-      this.bus.publish({
-        channel: "ai.stream",
-        source: name,
-        target: replySessionId,
-        event: "complete",
-        text: result,
-      });
-    }
+    // ai.stream "complete" for actor chat UI is emitted by actor-runner.runTask
+    // ai.request reply back to caller is handled by actor-runner.publishResult
     this.updateHud();
   }
 
   private registerCapabilities(): void {
     const roleIds = this.roles.map(r => r.id).join(", ");
+
     this.ctx.capabilityRegistry.register({
       name: "actor_dispatch",
       description: "Send a task to a named actor. If the actor exists, reuses its session (keeps memory). If new, creates one. The actor runs autonomously and reports back when done.",
@@ -203,7 +176,7 @@ Communication via bus:
         },
         required: ["name", "role", "task"],
       },
-      handler: async (input: any) => {
+      handler: (async (input: Record<string, unknown>) => {
         const sessionId = input.__sessionId ? String(input.__sessionId) : "main";
         const name = String(input.name);
         const roleId = String(input.role);
@@ -214,13 +187,13 @@ Communication via bus:
           if (actor.status === "running" || actor.status === "waiting_tools") {
             return { ok: false, error: `Actor '${name}' is busy (${actor.status}).` };
           }
-          actor.replySessionId = sessionId;
+          actor.replyTo = sessionId;
         } else {
           const role = this.roles.find(r => r.id === roleId);
           if (!role) return { ok: false, error: `Unknown role: ${roleId}. Available: ${this.roles.map(r => r.id).join(', ')}` };
           if (this.actors.size >= MAX_ACTORS) return { ok: false, error: `Pool full (${this.actors.size}/${MAX_ACTORS}).` };
 
-          actor = { id: name, role, status: "idle", createdAt: Date.now(), taskCount: 0, replySessionId: sessionId, chatHistory: [] };
+          actor = { id: name, role, status: "idle", createdAt: Date.now(), taskCount: 0, replyTo: sessionId, chatHistory: [] };
           this.actors.set(name, actor);
         }
 
@@ -234,19 +207,20 @@ Communication via bus:
           channel: "ai.request",
           source: "jarvis-core",
           target: "actor-" + name,
+          replyTo: sessionId,
           text: task,
-          data: { name, role: actor.role, replySessionId: sessionId },
-        });
+          data: { name, role: actor.role },
+        } as Parameters<EventBus["publish"]>[0]);
 
         return { ok: true, actorId: name };
-      },
+      }) as CapabilityHandler,
     });
 
     this.ctx.capabilityRegistry.register({
       name: "actor_list",
       description: "List all actors in the pool with their status, role, and task count.",
       input_schema: { type: "object", properties: {} },
-      handler: async () => ({
+      handler: (async () => ({
         maxActors: MAX_ACTORS,
         actors: [...this.actors.values()].map(a => ({
           id: a.id, role: a.role.id, status: a.status, taskCount: a.taskCount,
@@ -255,7 +229,7 @@ Communication via bus:
           uptime: Math.round((Date.now() - a.createdAt) / 1000) + "s",
         })),
         roles: this.roles.map(r => ({ id: r.id, name: r.name, description: r.description })),
-      }),
+      })) as CapabilityHandler,
     });
 
     this.ctx.capabilityRegistry.register({
@@ -266,7 +240,7 @@ Communication via bus:
         properties: { name: { type: "string", description: "Actor name to kill" } },
         required: ["name"],
       },
-      handler: async (input: any) => {
+      handler: (async (input: Record<string, unknown>) => {
         const name = String(input.name);
         const actor = this.actors.get(name);
         if (!actor) return { ok: false, error: `Actor not found: ${name}` };
@@ -275,7 +249,7 @@ Communication via bus:
         this.bus.publish({ channel: "system.event", source: this.id, event: "actor.kill", data: { name } });
         this.updateHud();
         return { ok: true };
-      },
+      }) as CapabilityHandler,
     });
 
     this.ctx.capabilityRegistry.register({
@@ -290,19 +264,20 @@ Communication via bus:
         },
         required: ["channel", "target", "text"],
       },
-      handler: async (input: any) => {
+      handler: (async (input: Record<string, unknown>) => {
         const caller = input.__sessionId ? String(input.__sessionId) : "unknown";
         const source = caller.startsWith("actor-") ? caller.replace("actor-", "") : "jarvis";
-        const { channel, target, text, ...rest } = input;
+        const channel = String(input.channel);
+        const target = String(input.target);
+        const text = String(input.text);
         this.bus.publish({
-          channel: String(channel) as any,
+          channel: channel as "ai.request",
           source,
-          target: String(target),
-          text: String(text),
-          ...rest,
-        });
+          target,
+          text,
+        } as Parameters<EventBus["publish"]>[0]);
         return { ok: true };
-      },
+      }) as CapabilityHandler,
     });
   }
 

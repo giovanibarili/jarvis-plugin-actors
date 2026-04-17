@@ -2,38 +2,35 @@ import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import type { ActorRole } from "./types.js";
 import { MAX_CAPABILITY_ROUNDS } from "./types.js";
+import type {
+  Piece,
+  PluginContext,
+  AIStreamEvent,
+  AIRequestMessage,
+  SystemEventMessage,
+  CapabilityCall,
+  CapabilityResult,
+  EventBus,
+} from "@jarvis/core";
 
-interface EventBus {
-  publish(msg: any): void;
-  subscribe(channel: string, handler: (msg: any) => void | Promise<void>): () => void;
-}
-
-interface Piece {
-  readonly id: string;
-  readonly name: string;
-  start(bus: EventBus): Promise<void>;
-  stop(): Promise<void>;
-}
-
-interface PluginContext {
-  bus: EventBus;
-  capabilityRegistry: any;
-  pluginDir: string;
-  sessionFactory: any;
-}
-
-interface AISession {
+/** Extended AISession — plugin actors need abort() beyond what @jarvis/core defines */
+interface ActorAISession {
   readonly sessionId: string;
-  sendAndStream(prompt: string): AsyncGenerator<any, void>;
-  addToolResults(toolCalls: any[], results: any[]): void;
-  continueAndStream(): AsyncGenerator<any, void>;
+  sendAndStream(prompt: string): AsyncGenerator<AIStreamEvent, void>;
+  addToolResults(toolCalls: CapabilityCall[], results: CapabilityResult[]): void;
+  continueAndStream(): AsyncGenerator<AIStreamEvent, void>;
   abort(): void;
   close(): void;
 }
 
 interface ActorSession {
-  session: AISession;
+  session: ActorAISession;
   stopped: boolean;
+}
+
+/** Dispatch message — AIRequestMessage with extra role data */
+interface ActorDispatchMessage extends AIRequestMessage {
+  data?: { role: ActorRole; name: string };
 }
 
 export class ActorRunnerPiece implements Piece {
@@ -69,12 +66,12 @@ export class ActorRunnerPiece implements Piece {
     this.started = true;
     this.bus = bus;
 
-    this.unsubDispatch = this.bus.subscribe("ai.request", (msg: any) => {
+    this.unsubDispatch = this.bus.subscribe<AIRequestMessage>("ai.request", (msg) => {
       if (!msg.target?.startsWith("actor-")) return;
       const name = msg.target.replace("actor-", "");
-      if (msg.data?.role) {
-        // Dispatch from pool — create session if needed
-        this.handleDispatch(msg);
+      const dispatch = msg as ActorDispatchMessage;
+      if (dispatch.data?.role) {
+        this.handleDispatch(dispatch);
       } else {
         // Direct message to actor
         const as = this.sessions.get(name);
@@ -82,13 +79,13 @@ export class ActorRunnerPiece implements Piece {
         if (msg.source === "actor-pool" || msg.source === name) return;
         if (this.running.has(name)) return;
         this.running.add(name);
-        this.runTask(name, msg.text, msg.target).finally(() => this.running.delete(name));
+        this.runTask(name, msg.text, msg.replyTo).finally(() => this.running.delete(name));
       }
     });
 
-    this.unsubKill = this.bus.subscribe("system.event", (msg: any) => {
-      if (msg.event === "actor.kill") this.killSession(msg.data.name);
-      if (msg.event === "actor.abort.request") this.abortSession(msg.data.name);
+    this.unsubKill = this.bus.subscribe<SystemEventMessage>("system.event", (msg) => {
+      if (msg.event === "actor.kill") this.killSession(msg.data.name as string);
+      if (msg.event === "actor.abort.request") this.abortSession(msg.data.name as string);
     });
   }
 
@@ -114,14 +111,15 @@ export class ActorRunnerPiece implements Piece {
     });
   }
 
-  private handleDispatch(msg: any): void {
-    const name = msg.target.replace("actor-", "");
-    const { role, replySessionId } = msg.data;
+  private handleDispatch(msg: ActorDispatchMessage): void {
+    const name = msg.target!.replace("actor-", "");
+    const role = msg.data!.role;
+    const replyTo = msg.replyTo;
     const task = msg.text;
-    if (this.running.has(name)) return; // already running
+    if (this.running.has(name)) return;
     this.running.add(name);
     this.getOrCreateSession(name, role);
-    this.runTask(name, task, replySessionId).finally(() => this.running.delete(name));
+    this.runTask(name, task, replyTo).finally(() => this.running.delete(name));
   }
 
   private getOrCreateSession(name: string, role: ActorRole): ActorSession {
@@ -132,13 +130,13 @@ export class ActorRunnerPiece implements Piece {
       label: `actor-${name}`,
       basePromptOverride: this.actorSystemPrompt,
       roleContext: this.buildRoleContext(role),
-    });
+    }) as ActorAISession;
     as = { session, stopped: false };
     this.sessions.set(name, as);
     return as;
   }
 
-  private async runTask(name: string, task: string, replySessionId: string): Promise<void> {
+  private async runTask(name: string, task: string, replyTo?: string): Promise<void> {
     const as = this.sessions.get(name);
     if (!as || as.stopped) return;
 
@@ -149,7 +147,7 @@ export class ActorRunnerPiece implements Piece {
 
     try {
       while (true) {
-        const capabilityCalls: any[] = [];
+        const capabilityCalls: CapabilityCall[] = [];
         fullText = "";
 
         for await (const event of stream) {
@@ -166,7 +164,7 @@ export class ActorRunnerPiece implements Piece {
               });
               break;
             case "tool_use":
-              if (event.toolUse) capabilityCalls.push(event.toolUse);
+              if (event.toolUse) capabilityCalls.push(event.toolUse as CapabilityCall);
               break;
             case "error":
               this.bus.publish({
@@ -176,7 +174,7 @@ export class ActorRunnerPiece implements Piece {
                 event: "error",
                 text: event.error ?? "Unknown error",
               });
-              this.publishResult(name, `Error: ${event.error}`, replySessionId);
+              this.publishResult(name, `Error: ${event.error}`, replyTo);
               return;
           }
         }
@@ -186,7 +184,6 @@ export class ActorRunnerPiece implements Piece {
         if (capabilityCalls.length > 0) {
           capabilityRounds++;
 
-          // Emit tool_start for each capability
           for (const call of capabilityCalls) {
             this.bus.publish({
               channel: "ai.stream",
@@ -199,9 +196,8 @@ export class ActorRunnerPiece implements Piece {
             });
           }
 
-          const results = await this.ctx.capabilityRegistry.execute(capabilityCalls);
+          const results: CapabilityResult[] = await this.ctx.capabilityRegistry.execute(capabilityCalls);
 
-          // Emit tool_done for each capability
           for (let i = 0; i < capabilityCalls.length; i++) {
             const call = capabilityCalls[i];
             const result = results[i];
@@ -225,7 +221,7 @@ export class ActorRunnerPiece implements Piece {
         break;
       }
 
-      // Complete event for actor chat
+      // Complete event for actor chat UI
       this.bus.publish({
         channel: "ai.stream",
         source: name,
@@ -234,19 +230,31 @@ export class ActorRunnerPiece implements Piece {
         text: fullText,
       });
 
-      this.publishResult(name, fullText, replySessionId);
+      this.publishResult(name, fullText, replyTo);
     } catch (err) {
-      this.publishResult(name, `Crashed: ${err}`, replySessionId);
+      this.publishResult(name, `Crashed: ${err}`, replyTo);
     }
   }
 
-  private publishResult(name: string, result: string, replySessionId: string): void {
+  private publishResult(name: string, result: string, replyTo?: string): void {
+    // Notify actor-pool of completion (for status tracking)
     this.bus.publish({
       channel: "system.event",
       source: "actor-runner",
       event: "actor.dispatch.result",
-      data: { name, result, replySessionId },
+      data: { name, result, replyTo: replyTo ?? "" },
     });
+
+    // Send result back to whoever requested it via ai.request
+    // JarvisCore will receive this as a new prompt and process it
+    if (replyTo) {
+      this.bus.publish({
+        channel: "ai.request",
+        source: `actor-${name}`,
+        target: replyTo,
+        text: `[ACTOR:${name}] ${result}`,
+      });
+    }
   }
 
   private killSession(name: string): void {

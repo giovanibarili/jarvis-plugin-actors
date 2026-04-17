@@ -15,7 +15,7 @@ export interface Actor {
   taskCount: number;
   currentTask?: string;
   lastResult?: string;
-  replySessionId: string;
+  replyTo: string;
   chatHistory: Array<{ role: 'user' | 'actor'; text: string; source?: string }>;
 }
 
@@ -23,13 +23,13 @@ export interface ActorDispatchEvent {
   name: string;
   role: ActorRole;
   task: string;
-  replySessionId: string;
+  replyTo: string;
 }
 
 export interface ActorDispatchResultEvent {
   name: string;
   result: string;
-  replySessionId: string;
+  replyTo: string;
 }
 
 export const BUILT_IN_ROLES: ActorRole[] = [
