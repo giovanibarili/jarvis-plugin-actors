@@ -303,7 +303,7 @@ export class ActorPoolPiece implements Piece {
       },
       handler: (async (input: Record<string, unknown>) => {
         const caller = input.__sessionId ? String(input.__sessionId) : "unknown";
-        const source = caller.startsWith("actor-") ? caller.replace("actor-", "") : "jarvis";
+        const source = caller.startsWith("actor-") ? caller : "jarvis";
         const channel = String(input.channel);
         const target = String(input.target);
         const text = String(input.text);
