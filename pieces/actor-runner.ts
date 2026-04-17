@@ -167,6 +167,17 @@ export class ActorRunnerPiece implements Piece {
               if (event.toolUse) capabilityCalls.push(event.toolUse as CapabilityCall);
               break;
             case "error":
+              if (event.error === "aborted") {
+                // User-initiated abort — not an error, stop gracefully
+                this.bus.publish({
+                  channel: "ai.stream",
+                  source: name,
+                  target: actorSessionId,
+                  event: "aborted",
+                });
+                this.publishStatus(name, "aborted");
+                return;
+              }
               this.bus.publish({
                 channel: "ai.stream",
                 source: name,
@@ -234,6 +245,16 @@ export class ActorRunnerPiece implements Piece {
     } catch (err) {
       this.publishResult(name, `Crashed: ${err}`, replyTo);
     }
+  }
+
+  private publishStatus(name: string, status: string): void {
+    // Notify actor-pool of status change (for UI tracking) without sending to main
+    this.bus.publish({
+      channel: "system.event",
+      source: "actor-runner",
+      event: "actor.dispatch.result",
+      data: { name, result: `[${status}]`, replyTo: "" },
+    });
   }
 
   private publishResult(name: string, result: string, replyTo?: string): void {
