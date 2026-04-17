@@ -116,6 +116,8 @@ export class ActorChatPiece implements Piece {
   }
 
   private parseUrl(url: string): { actorName: string; action: string } | null {
+    // Special route: POST /plugins/actors/create
+    if (url === "/plugins/actors/create") return { actorName: "", action: "create" };
     const match = url?.match(/^\/plugins\/actors\/([^/]+)\/(send|stream|history|kill|abort)$/);
     if (!match) return null;
     return { actorName: match[1], action: match[2] };
@@ -183,6 +185,33 @@ export class ActorChatPiece implements Piece {
       });
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    if (parsed.action === "create") {
+      let body = "";
+      req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+      req.on("end", () => {
+        try {
+          const { name, role } = JSON.parse(body) as { name: string; role: string };
+          if (!name || !role) {
+            res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+            res.end(JSON.stringify({ ok: false, error: "name and role are required" }));
+            return;
+          }
+          // Request actor creation — actor-pool will register it, actor-runner will create the session
+          this.bus.publish({
+            channel: "system.event",
+            source: "actor-chat",
+            event: "actor.create.request",
+            data: { name, roleId: role },
+          });
+          res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+          res.end(JSON.stringify({ ok: true }));
+        } catch {
+          res.writeHead(400); res.end();
+        }
+      });
       return;
     }
 

@@ -116,6 +116,9 @@ export class ActorPoolPiece implements Piece {
           }
         }
       }
+      if (msg.event === "actor.create.request") {
+        this.handleCreateRequest(msg);
+      }
     });
 
     this.registerCapabilities();
@@ -145,6 +148,39 @@ export class ActorPoolPiece implements Piece {
       source: this.id,
       action: "remove",
       pieceId: this.id,
+    });
+  }
+
+  private handleCreateRequest(msg: SystemEventMessage): void {
+    const name = msg.data?.name as string | undefined;
+    const roleId = msg.data?.roleId as string | undefined;
+    if (!name || !roleId) return;
+
+    // Already exists
+    if (this.actors.has(name)) return;
+
+    const role = this.roles.find(r => r.id === roleId);
+    if (!role) return;
+    if (this.actors.size >= MAX_ACTORS) return;
+
+    const actor: Actor = { id: name, role, status: "idle", createdAt: Date.now(), taskCount: 0, replyTo: "main", chatHistory: [] };
+    this.actors.set(name, actor);
+    this.updateHud();
+
+    // Tell actor-runner to create the AI session (dispatch with no real task — just init)
+    this.bus.publish({
+      channel: "system.event",
+      source: this.id,
+      event: "actor.session.create",
+      data: { name, role },
+    });
+
+    // Notify JARVIS main session
+    this.bus.publish({
+      channel: "ai.request",
+      source: "system",
+      target: "main",
+      text: `[SYSTEM] Actor "${name}" (${role.id}) created from the HUD and is idle in the pool.`,
     });
   }
 
@@ -290,6 +326,7 @@ export class ActorPoolPiece implements Piece {
       active: actors.filter(a => a.status === "running" || a.status === "waiting_tools").length,
       idle: actors.filter(a => a.status === "idle").length,
       actors: actors.map(a => ({ id: a.id, role: a.role.id, status: a.status, tasks: a.taskCount })),
+      roles: this.roles.map(r => ({ id: r.id, name: r.name, description: r.description })),
     };
   }
 

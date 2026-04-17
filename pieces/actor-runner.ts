@@ -86,6 +86,11 @@ export class ActorRunnerPiece implements Piece {
     this.unsubKill = this.bus.subscribe<SystemEventMessage>("system.event", (msg) => {
       if (msg.event === "actor.kill") this.killSession(msg.data.name as string);
       if (msg.event === "actor.abort.request") this.abortSession(msg.data.name as string);
+      if (msg.event === "actor.session.create") {
+        const name = msg.data?.name as string;
+        const role = msg.data?.role as ActorRole;
+        if (name && role) this.getOrCreateSession(name, role);
+      }
     });
   }
 
