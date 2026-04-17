@@ -11,5 +11,6 @@ Lifecycle:
 
 Communication via bus:
 - `bus_publish(channel="ai.request", target="actor-{name}", text="...")` — send follow-up messages to existing actors
+- Use `reply_to=true` when you expect a response back — the target will automatically route its answer to your session
 
 Custom roles are loaded from `~/.jarvis/roles/*.md`. Each file defines a role (YAML frontmatter: name, description; body: system prompt). The filename (without .md) is the role ID.

@@ -291,13 +291,14 @@ export class ActorPoolPiece implements Piece {
 
     this.ctx.capabilityRegistry.register({
       name: "bus_publish",
-      description: "Publish a message to the EventBus. Use to send messages to specific targets.",
+      description: "Publish a message to the EventBus. Use to send messages to specific targets. If you expect a response back, set reply_to to true — the target will automatically route its answer back to your session.",
       input_schema: {
         type: "object",
         properties: {
           channel: { type: "string", description: "Bus channel (e.g. 'ai.request', 'system.event')" },
           target: { type: "string", description: "Target ID (e.g. 'actor-alice', 'main')" },
           text: { type: "string", description: "Message text" },
+          reply_to: { type: "boolean", description: "If true, the target will route its response back to the caller's session. Use when you expect an answer." },
         },
         required: ["channel", "target", "text"],
       },
@@ -307,8 +308,14 @@ export class ActorPoolPiece implements Piece {
         const channel = String(input.channel);
         const target = String(input.target);
         const text = String(input.text);
-        // Auto-set replyTo so the target actor sends its response back to the caller
-        const replyTo = caller.startsWith("actor-") ? caller : undefined;
+        const wantsReply = !!input.reply_to;
+        // Set replyTo only when explicitly requested
+        let replyTo: string | undefined;
+        if (wantsReply) {
+          replyTo = caller.startsWith("actor-") ? caller
+            : caller === "main" ? "main"
+            : undefined;
+        }
         this.bus.publish({
           channel: channel as "ai.request",
           source,
