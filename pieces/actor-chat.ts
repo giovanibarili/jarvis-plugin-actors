@@ -46,7 +46,9 @@ export class ActorChatPiece implements Piece {
         if (msg.source === "actor-chat") return; // ignore our own sends
         const name = msg.target.replace("actor-", "");
         this.ensureSubscribed(name);
-        const source = msg.source === "jarvis-core" ? "jarvis" : (msg.source ?? "unknown");
+        const source = msg.source === "jarvis-core" ? "jarvis"
+          : msg.source?.startsWith("actor-") ? msg.source.replace("actor-", "actor:")
+          : (msg.source ?? "unknown");
         const history = this.getHistory(name);
         history.push({ role: 'user', text: msg.text, source });
         this.broadcast(name, { type: "user", text: msg.text, source });

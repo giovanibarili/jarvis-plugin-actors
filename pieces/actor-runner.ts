@@ -41,6 +41,7 @@ export class ActorRunnerPiece implements Piece {
   private ctx: PluginContext;
   private sessions = new Map<string, ActorSession>();
   private running = new Set<string>();
+  private queues = new Map<string, Array<{ text: string; replyTo?: string }>>();
   private actorSystemPrompt: string;
   private started = false;
   private unsubDispatch?: () => void;
@@ -77,9 +78,14 @@ export class ActorRunnerPiece implements Piece {
         const as = this.sessions.get(name);
         if (!as || as.stopped) return;
         if (msg.source === "actor-pool" || msg.source === name) return;
-        if (this.running.has(name)) return;
+        if (this.running.has(name)) {
+          // Queue the message for when the actor finishes
+          if (!this.queues.has(name)) this.queues.set(name, []);
+          this.queues.get(name)!.push({ text: msg.text, replyTo: msg.replyTo });
+          return;
+        }
         this.running.add(name);
-        this.runTask(name, msg.text, msg.replyTo).finally(() => this.running.delete(name));
+        this.runTask(name, msg.text, msg.replyTo).finally(() => this.drainQueue(name));
       }
     });
 
@@ -97,6 +103,7 @@ export class ActorRunnerPiece implements Piece {
   async stop(): Promise<void> {
     this.unsubDispatch?.();
     this.unsubKill?.();
+    this.queues.clear();
     for (const [, as] of this.sessions) {
       as.stopped = true;
       as.session.close();
@@ -121,10 +128,26 @@ export class ActorRunnerPiece implements Piece {
     const role = msg.data!.role;
     const replyTo = msg.replyTo;
     const task = msg.text;
-    if (this.running.has(name)) return;
-    this.running.add(name);
     this.getOrCreateSession(name, role);
-    this.runTask(name, task, replyTo).finally(() => this.running.delete(name));
+    if (this.running.has(name)) {
+      if (!this.queues.has(name)) this.queues.set(name, []);
+      this.queues.get(name)!.push({ text: task, replyTo });
+      return;
+    }
+    this.running.add(name);
+    this.runTask(name, task, replyTo).finally(() => this.drainQueue(name));
+  }
+
+  private async drainQueue(name: string): Promise<void> {
+    const queue = this.queues.get(name);
+    if (queue && queue.length > 0) {
+      const next = queue.shift()!;
+      // Still running — process next queued message
+      this.runTask(name, next.text, next.replyTo).finally(() => this.drainQueue(name));
+    } else {
+      // Nothing left — mark as not running
+      this.running.delete(name);
+    }
   }
 
   private getOrCreateSession(name: string, role: ActorRole): ActorSession {
@@ -295,5 +318,7 @@ export class ActorRunnerPiece implements Piece {
       as.session.close();
       this.sessions.delete(name);
     }
+    this.queues.delete(name);
+    this.running.delete(name);
   }
 }
