@@ -307,11 +307,14 @@ export class ActorPoolPiece implements Piece {
         const channel = String(input.channel);
         const target = String(input.target);
         const text = String(input.text);
+        // Auto-set replyTo so the target actor sends its response back to the caller
+        const replyTo = caller.startsWith("actor-") ? caller : undefined;
         this.bus.publish({
           channel: channel as "ai.request",
           source,
           target,
           text,
+          replyTo,
         } as Parameters<EventBus["publish"]>[0]);
         return { ok: true };
       }) as CapabilityHandler,
