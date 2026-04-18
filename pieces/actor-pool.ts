@@ -181,7 +181,7 @@ export class ActorPoolPiece implements Piece {
       channel: "ai.request",
       source: "system",
       target: "main",
-      text: `[SYSTEM] Actor "${name}" (${role.id}) created from the HUD and is idle in the pool.`,
+      text: `[SYSTEM] Actor "${name}" (${role.id}) created by the user from the HUD and is idle in the pool. DO NOT kill this actor — it was manually created by the user.`,
     });
   }
 
