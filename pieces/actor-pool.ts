@@ -1,6 +1,6 @@
 import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join, basename } from "node:path";
-import type { Actor, ActorRole, ActorDispatchResultEvent } from "./types.js";
+import type { Actor, ActorRole, ActorDispatchResultEvent, ActorReportedStatus, ActorStatusEvent } from "./types.js";
 import { BUILT_IN_ROLES, MAX_ACTORS } from "./types.js";
 import type {
   Piece,
@@ -103,6 +103,7 @@ export class ActorPoolPiece implements Piece {
     this.bus = bus;
 
     this.unsubDispatchResult = this.bus.subscribe<SystemEventMessage>("system.event", (msg) => {
+      if (msg.event === "actor.status") this.handleActorStatus(msg);
       if (msg.event === "actor.dispatch.result") this.handleDispatchResult(msg);
       if (msg.event === "actor.kill.request") {
         const name = msg.data?.name as string | undefined;
@@ -184,6 +185,14 @@ export class ActorPoolPiece implements Piece {
     });
   }
 
+  private handleActorStatus(msg: SystemEventMessage): void {
+    const { actorId, status, message } = msg.data as unknown as ActorStatusEvent;
+    const actor = this.actors.get(actorId);
+    if (!actor) return;
+    actor.statusMessage = `[${status}] ${message}`;
+    this.updateHud();
+  }
+
   private handleDispatchResult(msg: SystemEventMessage): void {
     const { name, result } = msg.data as unknown as ActorDispatchResultEvent;
     const actor = this.actors.get(name);
@@ -191,6 +200,7 @@ export class ActorPoolPiece implements Piece {
       actor.status = "idle";
       actor.lastResult = result;
       actor.currentTask = undefined;
+      actor.statusMessage = undefined;
       if (result) actor.chatHistory.push({ role: 'actor', text: result });
     }
     // ai.stream "complete" for actor chat UI is emitted by actor-runner.runTask
@@ -290,6 +300,41 @@ export class ActorPoolPiece implements Piece {
     });
 
     this.ctx.capabilityRegistry.register({
+      name: "actor_status",
+      description: "Report current actor status to the HUD. Call this proactively when your state changes.",
+      input_schema: {
+        type: "object",
+        properties: {
+          status: {
+            type: "string",
+            enum: ["working", "waiting", "done", "error", "needs_input"],
+            description: "Current actor status",
+          },
+          message: {
+            type: "string",
+            description: "Short description of current state, e.g. 'Running tests', 'Waiting for API response'",
+          },
+        },
+        required: ["status", "message"],
+      },
+      handler: (async (input: Record<string, unknown>) => {
+        const caller = input.__sessionId ? String(input.__sessionId) : "unknown";
+        const actorId = caller.startsWith("actor-") ? caller.replace("actor-", "") : caller;
+        const status = String(input.status) as ActorReportedStatus;
+        const message = String(input.message);
+
+        this.bus.publish({
+          channel: "system.event",
+          source: `actor-${actorId}`,
+          event: "actor.status",
+          data: { actorId, status, message },
+        });
+
+        return { ok: true };
+      }) as CapabilityHandler,
+    });
+
+    this.ctx.capabilityRegistry.register({
       name: "bus_publish",
       description: "Publish a message to the EventBus. Use to send messages to specific targets.\n\n"
         + "Fire-and-forget (default): omit reply_to. The message is delivered but "
@@ -334,7 +379,7 @@ export class ActorPoolPiece implements Piece {
       total: actors.length,
       active: actors.filter(a => a.status === "running" || a.status === "waiting_tools").length,
       idle: actors.filter(a => a.status === "idle").length,
-      actors: actors.map(a => ({ id: a.id, role: a.role.id, status: a.status, tasks: a.taskCount })),
+      actors: actors.map(a => ({ id: a.id, role: a.role.id, status: a.status, tasks: a.taskCount, statusMessage: a.statusMessage })),
       roles: this.roles.map(r => ({ id: r.id, name: r.name, description: r.description })),
     };
   }
