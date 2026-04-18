@@ -7,6 +7,8 @@ export interface ActorRole {
 
 export type ActorStatus = "idle" | "running" | "waiting_tools" | "stopped";
 
+export type ActorReportedStatus = "working" | "waiting" | "done" | "error" | "needs_input";
+
 export interface Actor {
   id: string;
   role: ActorRole;
@@ -17,6 +19,14 @@ export interface Actor {
   lastResult?: string;
   replyTo: string;
   chatHistory: Array<{ role: 'user' | 'actor'; text: string; source?: string }>;
+  /** Self-reported status from actor_status tool calls */
+  statusMessage?: string;
+}
+
+export interface ActorStatusEvent {
+  actorId: string;
+  status: ActorReportedStatus;
+  message: string;
 }
 
 export interface ActorDispatchEvent {
