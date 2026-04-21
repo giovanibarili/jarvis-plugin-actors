@@ -69,7 +69,7 @@ export class ActorRunnerPiece implements Piece {
         // Direct message to actor
         const sessionId = `actor-${name}`;
         if (!this.sessions.has(sessionId)) return;
-        if (msg.source === "actor-pool" || msg.source === name) return;
+        if (msg.source === "actor-pool" || msg.source === `actor-${name}`) return;
         if (this.running.has(name)) {
           // Queue the message for when the actor finishes
           if (!this.queues.has(name)) this.queues.set(name, []);
