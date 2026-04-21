@@ -352,6 +352,52 @@ Then the response should be {"ok": true}
 And actor "alpha" should process the message
 ```
 
+### Scenario: Send a message with images via HTTP
+
+```gherkin
+Given actor "alpha" exists with status "idle"
+When I POST to /plugins/actors/alpha/send with body:
+  {
+    "text": "Describe this image",
+    "images": [{"label": "Image #1", "base64": "<valid-png-base64>", "mediaType": "image/png"}]
+  }
+Then the response should be {"ok": true}
+And actor "alpha" should receive the message with the image attached
+And the actor's response should describe the image content
+```
+
+**Validation command:**
+```
+1. Create actor: actor_dispatch(name="vision", role="generic", task="Say hello")
+2. Wait for completion
+3. Take a screenshot: hud_screenshot()
+4. POST the screenshot as an image to the actor via HTTP:
+   curl -s -X POST http://localhost:50052/plugins/actors/vision/send \
+     -H "Content-Type: application/json" \
+     -d '{"text": "What do you see in this image?", "images": [{"label":"Image #1","base64":"...","mediaType":"image/png"}]}'
+5. Verify: actor processes the image and responds with a description
+```
+
+### Scenario: Images propagated via bus dispatch
+
+```gherkin
+Given actor "alpha" exists with status "idle"
+When a bus message with images is published to actor "alpha":
+  bus_publish(channel="ai.request", target="actor-alpha", text="Describe this", images=[...])
+Then the images should be forwarded to the actor's AI session via sendAndStream(text, images)
+And the actor should process the multimodal input
+```
+
+### Scenario: Images queued when actor is busy
+
+```gherkin
+Given actor "alpha" is running a task
+When I POST to /plugins/actors/alpha/send with text and images
+Then the message (including images) should be queued
+And after the current task completes, the queued message with images should be processed
+And the actor should see and respond to the image content
+```
+
 ### Scenario: Stream actor output via SSE
 
 ```gherkin
@@ -374,6 +420,16 @@ Then the response should contain an array of chat entries
 And each entry should have "role" ("user" or "actor") and "text"
 ```
 
+### Scenario: Get chat history from SessionManager
+
+```gherkin
+Given actor "alpha" has processed at least one task
+When I GET /plugins/actors/alpha/history
+Then the response should be sourced from SessionManager (not an in-memory duplicate)
+And the entries should match the raw AI session messages (parsed into user/actor roles)
+And tool_result messages should be filtered out (same as core ChatPiece behavior)
+```
+
 ### Scenario: Abort a running actor via HTTP
 
 ```gherkin
@@ -381,6 +437,74 @@ Given actor "alpha" is running a task
 When I POST to /plugins/actors/alpha/abort
 Then the actor's current operation should be aborted
 And an "aborted" event should be emitted on the actor's SSE stream
+```
+
+## Feature: Session Persistence (via SessionManager)
+
+### Scenario: Actor session is saved to disk on idle
+
+```gherkin
+Given actor "alpha" has completed a task and transitioned to "idle"
+When I check the sessions directory (.jarvis/sessions/)
+Then a file "actor-alpha.json" should exist
+And it should contain the actor's conversation messages
+And the provider and model fields should match the current configuration
+```
+
+**Validation command:**
+```
+1. actor_dispatch(name="alpha", role="generic", task="Say hello")
+2. Wait for completion (status → idle)
+3. bash: cat .jarvis/sessions/actor-alpha.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'messages: {d[\"messageCount\"]}, provider: {d[\"provider\"]}')"
+   → Should show messageCount >= 2, provider "anthropic"
+```
+
+### Scenario: Actor session auto-saves periodically
+
+```gherkin
+Given actor "alpha" exists and has processed tasks
+When 30 seconds pass (the auto-save interval)
+Then the actor's session should be auto-saved to disk
+And the savedAt timestamp should be updated
+```
+
+### Scenario: Actor session persists across restarts
+
+```gherkin
+Given actor "alpha" has processed a task and the session was saved
+When JARVIS is restarted
+And actor "alpha" is re-dispatched with the same name and role
+Then the actor should restore its previous conversation history
+And when asked "What did I ask you before?", it should reference the pre-restart task
+```
+
+**Validation command:**
+```
+1. actor_dispatch(name="persist-test", role="generic", task="Remember the word 'pineapple'")
+2. Wait for completion
+3. Verify: bash: test -f .jarvis/sessions/actor-persist-test.json && echo "saved"
+4. jarvis_reset (restart JARVIS)
+5. After restart: actor_dispatch(name="persist-test", role="generic", task="What word did I ask you to remember?")
+6. Verify: response mentions "pineapple"
+```
+
+### Scenario: Actor session saved on kill
+
+```gherkin
+Given actor "alpha" has processed tasks
+When I call actor_kill with name "alpha"
+Then the session should be saved to disk before closing
+And the file .jarvis/sessions/actor-alpha.json should still exist after kill
+```
+
+### Scenario: Abort cleans up message history properly
+
+```gherkin
+Given actor "alpha" is in "waiting_tools" state (waiting for a tool to complete)
+When I POST to /plugins/actors/alpha/abort
+Then cleanupAbortedTools should be called on the session (same as core JarvisCore behavior)
+And the actor's message history should not contain orphaned tool_use blocks without matching tool_result
+And subsequent tasks should work correctly without message format errors
 ```
 
 ## Feature: Error Handling
@@ -464,9 +588,15 @@ Run these commands in order to validate the full lifecycle:
 4. actor_list()
    → Verify: shows actor "test" with role "generic", taskCount >= 2
 
-5. actor_kill(name="test")
+5. GET /plugins/actors/test/history
+   → Verify: returns array with user/actor entries parsed from SessionManager
+
+6. bash: cat .jarvis/sessions/actor-test.json | python3 -c "import json,sys; print(json.load(sys.stdin)['messageCount'])"
+   → Verify: session persisted to disk, messageCount > 0
+
+7. actor_kill(name="test")
    → Verify: pool empty, HUD shows 0/5
 
-6. hud_screenshot()
+8. hud_screenshot()
    → Verify: Actor Pool panel visible, "no actors" displayed
 ```

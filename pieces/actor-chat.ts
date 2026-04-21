@@ -1,4 +1,3 @@
-import { MAX_CHAT_HISTORY } from "./types.js";
 import type {
   Piece,
   PluginContext,
@@ -6,14 +5,9 @@ import type {
   AIStreamMessage,
   EventBus,
   RouteHandler,
+  SessionManager,
 } from "@jarvis/core";
 import type { IncomingMessage, ServerResponse } from "node:http";
-
-interface ChatEntry {
-  role: string;
-  text: string;
-  source?: string;
-}
 
 export class ActorChatPiece implements Piece {
   readonly id = "actor-chat";
@@ -21,8 +15,8 @@ export class ActorChatPiece implements Piece {
 
   private bus!: EventBus;
   private ctx: PluginContext;
+  private sessions!: SessionManager;
   private started = false;
-  private chatHistories = new Map<string, ChatEntry[]>();
   private sseClients = new Map<string, Set<ServerResponse>>();
   private unsubscribes: Array<() => void> = [];
   private subscribedActors = new Set<string>();
@@ -35,6 +29,11 @@ export class ActorChatPiece implements Piece {
     if (this.started) return;
     this.started = true;
     this.bus = bus;
+
+    if (!this.ctx.sessionManager) {
+      throw new Error("ActorChatPiece requires sessionManager in PluginContext (requires @jarvis/core >= 0.3.0)");
+    }
+    this.sessions = this.ctx.sessionManager;
 
     this.ctx.registerRoute("GET", "/plugins/actors/", ((req: IncomingMessage, res: ServerResponse) => this.handleGet(req, res)) as RouteHandler);
     this.ctx.registerRoute("POST", "/plugins/actors/", ((req: IncomingMessage, res: ServerResponse) => this.handlePost(req, res)) as RouteHandler);
@@ -49,8 +48,6 @@ export class ActorChatPiece implements Piece {
         const source = msg.source === "jarvis-core" ? "jarvis"
           : msg.source?.startsWith("actor-") ? msg.source.replace("actor-", "actor:")
           : (msg.source ?? "unknown");
-        const history = this.getHistory(name);
-        history.push({ role: 'user', text: msg.text, source });
         this.broadcast(name, { type: "user", text: msg.text, source });
       })
     );
@@ -79,9 +76,6 @@ export class ActorChatPiece implements Piece {
             this.broadcast(actorName, { type: "delta", text: msg.text });
             break;
           case "complete": {
-            const history = this.getHistory(actorName);
-            history.push({ role: 'actor', text: msg.text ?? "" });
-            if (history.length > MAX_CHAT_HISTORY) history.splice(0, history.length - MAX_CHAT_HISTORY);
             this.broadcast(actorName, { type: "done", fullText: msg.text });
             break;
           }
@@ -103,11 +97,6 @@ export class ActorChatPiece implements Piece {
         }
       })
     );
-  }
-
-  private getHistory(name: string): ChatEntry[] {
-    if (!this.chatHistories.has(name)) this.chatHistories.set(name, []);
-    return this.chatHistories.get(name)!;
   }
 
   private broadcast(actorName: string, data: Record<string, unknown>): void {
@@ -147,11 +136,68 @@ export class ActorChatPiece implements Piece {
 
     if (action === "history") {
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-      res.end(JSON.stringify(this.getHistory(actorName)));
+      const sessionId = `actor-${actorName}`;
+      if (!this.sessions.has(sessionId)) {
+        res.end("[]");
+        return;
+      }
+      try {
+        const managed = this.sessions.get(sessionId);
+        const rawMessages = managed.session.getMessages() as any[];
+        const entries = this.parseMessagesToHistory(rawMessages);
+        res.end(JSON.stringify(entries));
+      } catch {
+        res.end("[]");
+      }
       return;
     }
 
     res.writeHead(404); res.end();
+  }
+
+  /**
+   * Parse raw AI session messages into chat history entries.
+   * Same logic as core's ChatPiece.handleHistory — single source of truth from the session.
+   */
+  private parseMessagesToHistory(rawMessages: any[]): any[] {
+    const entries: any[] = [];
+
+    for (const msg of rawMessages) {
+      if (msg.role === "user") {
+        // Skip tool_result messages (they appear as role=user with tool_result blocks)
+        if (Array.isArray(msg.content) && msg.content.every((b: any) => b.type === "tool_result")) {
+          continue;
+        }
+        let text = "";
+        if (typeof msg.content === "string") {
+          text = msg.content;
+        } else if (Array.isArray(msg.content)) {
+          for (const block of msg.content) {
+            if (block.type === "text") text += block.text;
+          }
+        }
+        if (!text.trim()) continue; // Skip empty user messages
+        entries.push({ role: "user", text, source: "jarvis" });
+      } else if (msg.role === "assistant") {
+        let text = "";
+        const toolUses: any[] = [];
+        if (typeof msg.content === "string") {
+          text = msg.content;
+        } else if (Array.isArray(msg.content)) {
+          for (const block of msg.content) {
+            if (block.type === "text") text += block.text;
+            if (block.type === "tool_use") toolUses.push(block);
+          }
+        }
+        if (text) {
+          entries.push({ role: "actor", text });
+        }
+        // Tool uses are available but the actor chat UI renders them via SSE events,
+        // so we don't include them in history hydration to avoid duplication.
+      }
+    }
+
+    return entries;
   }
 
   private handlePost(req: IncomingMessage, res: ServerResponse): void {
@@ -224,9 +270,7 @@ export class ActorChatPiece implements Piece {
     req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
     req.on("end", () => {
       try {
-        const { text } = JSON.parse(body) as { text: string };
-        const history = this.getHistory(actorName);
-        history.push({ role: 'user', text, source: 'you' });
+        const { text, images } = JSON.parse(body) as { text: string; images?: any[] };
         this.broadcast(actorName, { type: "user", text, source: "you" });
         this.ensureSubscribed(actorName);
 
@@ -235,7 +279,8 @@ export class ActorChatPiece implements Piece {
           source: "actor-chat",
           target: "actor-" + actorName,
           text,
-        });
+          ...(images && images.length > 0 ? { images } : {}),
+        } as any);
 
         res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
         res.end(JSON.stringify({ ok: true }));
