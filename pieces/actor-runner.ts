@@ -28,6 +28,7 @@ export class ActorRunnerPiece implements Piece {
   private ctx: PluginContext;
   private sessions!: SessionManager;
   private running = new Set<string>();
+  private activeSessions = new Set<string>(); // all actor names with live sessions
   private queues = new Map<string, Array<{ text: string; replyTo?: string; images?: any[] }>>();
   private actorSystemPrompt: string;
   private started = false;
@@ -66,9 +67,15 @@ export class ActorRunnerPiece implements Piece {
       if (dispatch.data?.role) {
         this.handleDispatch(dispatch);
       } else {
-        // Direct message to actor
+        // Direct message to actor — lazy-create session if it has saved state on disk
         const sessionId = `actor-${name}`;
-        if (!this.sessions.has(sessionId)) return;
+        if (!this.sessions.has(sessionId)) {
+          // Check if there's a saved session on disk (persistent actor restored by pool)
+          const savedSessions = this.sessions.listSaved("actor-");
+          if (!savedSessions.includes(sessionId)) return;
+          // Lazy-create with generic role — conversation history will be restored from disk
+          this.getOrCreateSession(name, { id: "generic", name: "Generic Worker", description: "", systemPrompt: "You are a worker agent for JARVIS. Execute tasks given to you autonomously. Use the available tools as needed. Be thorough and report your results clearly." });
+        }
         if (msg.source === "actor-pool" || msg.source === `actor-${name}`) return;
         if (this.running.has(name)) {
           // Queue the message for when the actor finishes
@@ -96,10 +103,16 @@ export class ActorRunnerPiece implements Piece {
     this.unsubDispatch?.();
     this.unsubKill?.();
     this.queues.clear();
-    // Close all actor sessions via SessionManager (saves before closing)
-    for (const name of this.running) {
-      this.sessions.close(`actor-${name}`);
+    // Close all actor sessions — ephemeral ones should NOT be saved
+    for (const name of this.activeSessions) {
+      const sessionId = `actor-${name}`;
+      if (this.sessions.isEphemeral(sessionId)) {
+        // Delete saved file if it exists, then close without saving
+        this.sessions.clearSaved(sessionId);
+      }
+      this.sessions.close(sessionId);
     }
+    this.activeSessions.clear();
     this.running.clear();
   }
 
@@ -152,6 +165,7 @@ export class ActorRunnerPiece implements Piece {
 
   private getOrCreateSession(name: string, role: ActorRole): ManagedSession {
     const sessionId = `actor-${name}`;
+    this.activeSessions.add(name);
     if (this.sessions.has(sessionId)) {
       return this.sessions.get(sessionId);
     }
@@ -339,9 +353,12 @@ export class ActorRunnerPiece implements Piece {
 
   private killSession(name: string): void {
     const sessionId = `actor-${name}`;
-    // SessionManager.close() saves before closing
+    if (this.sessions.isEphemeral(sessionId)) {
+      this.sessions.clearSaved(sessionId);
+    }
     this.sessions.close(sessionId);
     this.queues.delete(name);
     this.running.delete(name);
+    this.activeSessions.delete(name);
   }
 }

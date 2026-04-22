@@ -6,7 +6,7 @@ const ACTOR_BASE = 'http://localhost:50052/plugins/actors'
 
 export default function ActorPoolRenderer({ state }: { state: any }) {
   const data = state.data as any
-  const actors = (data?.actors ?? []) as Array<{ id: string; role: string; status: string; tasks: number }>
+  const actors = (data?.actors ?? []) as Array<{ id: string; role: string; status: string; tasks: number; persistent?: boolean }>
   const roles = (data?.roles ?? []) as Array<{ id: string; name: string; description: string }>
   const total = data?.total ?? 0
   const maxActors = data?.maxActors ?? 5
@@ -40,12 +40,19 @@ export default function ActorPoolRenderer({ state }: { state: any }) {
   }
 
   const onActorClick = (name: string) => {
-    window.dispatchEvent(new CustomEvent('actor-open-chat', { detail: { name } }))
+    fetch(`${ACTOR_BASE}/open-chat/${name}`, { method: 'POST' }).catch(() => {})
   }
 
   const onActorKill = (e: any, name: string) => {
     e.stopPropagation()
-    window.dispatchEvent(new CustomEvent('actor-kill', { detail: { name } }))
+    fetch(`${ACTOR_BASE}/${name}/kill`, { method: 'POST' }).catch(() => {})
+  }
+
+  const onTogglePersistent = async (e: any, name: string) => {
+    e.stopPropagation()
+    try {
+      await fetch(`${ACTOR_BASE}/toggle-persistent/${name}`, { method: 'POST' })
+    } catch {}
   }
 
   const handleCreate = async () => {
@@ -143,6 +150,15 @@ export default function ActorPoolRenderer({ state }: { state: any }) {
           <span className="dot" style={{ color: statusColor(a.status) }}>●</span>
           <span className="label" style={{ flex: 1 }}>{a.id}</span>
           <span className="rightValue" style={{ marginRight: '6px' }}>{a.role} #{a.tasks}</span>
+          <span
+            onClick={(e: any) => onTogglePersistent(e, a.id)}
+            style={{
+              cursor: 'pointer', fontSize: '9px', lineHeight: 1, marginRight: '4px',
+              color: a.persistent ? '#4af' : '#444',
+              opacity: a.persistent ? 1 : 0.5,
+            }}
+            title={a.persistent ? 'Persistent (click to make ephemeral)' : 'Ephemeral (click to persist)'}
+          >{a.persistent ? '💾' : '💨'}</span>
           <span
             onClick={(e: any) => onActorKill(e, a.id)}
             style={{ cursor: 'pointer', color: '#666', fontSize: '9px', lineHeight: 1 }}

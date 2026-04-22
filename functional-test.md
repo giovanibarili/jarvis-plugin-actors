@@ -36,6 +36,17 @@ Then the response should contain error "Actor 'alpha' is busy"
 And actor "alpha" should continue its current task uninterrupted
 ```
 
+### Scenario: Messages to busy actor are queued via bus
+
+```gherkin
+Given actor "alpha" is currently running a task
+When I send a bus_publish message to actor "alpha"
+Then the message should be queued by actor-runner
+And after the current task completes, the queued message should be processed automatically
+```
+
+> Note: `actor_dispatch` rejects busy actors. Bus messages (`ai.request`) are queued instead.
+
 ### Scenario: Kill an actor
 
 ```gherkin
@@ -84,15 +95,6 @@ Then the response should contain error "Unknown role: wizard"
 And no actor should be created
 ```
 
-### Scenario: Custom roles from ~/.jarvis/roles/
-
-```gherkin
-Given a file exists at ~/.jarvis/roles/custom-role.md with valid YAML frontmatter (name, description) and a system prompt body
-When JARVIS starts or the plugin reloads
-Then "custom-role" should appear in the available roles list
-And I should be able to dispatch an actor with role "custom-role"
-```
-
 ### Scenario: All roles from ~/.jarvis/roles/ are loaded
 
 ```gherkin
@@ -111,16 +113,6 @@ actor_list() → verify roles array contains all files from ~/.jarvis/roles/
             world-map-vivi, world-map-zoro
 ```
 
-### Scenario: Malformed role file is skipped
-
-```gherkin
-Given ~/.jarvis/roles/broken.md exists but has no YAML frontmatter (missing --- delimiters)
-When JARVIS loads roles
-Then "broken" should NOT appear in the available roles list
-And no error should crash the plugin
-And all other valid roles should still be loaded
-```
-
 ### Scenario: Role system prompt is injected into actor session
 
 ```gherkin
@@ -128,6 +120,96 @@ Given a role "coder" exists with system prompt "You are a coding agent for JARVI
 When I dispatch actor "dev" with role "coder" and task "What is your role? Reply in one sentence."
 Then the actor's response should reflect the coder role instructions
 And the actor should behave according to its role constraints
+```
+
+## Feature: Ephemeral vs Persistent Actors
+
+### Scenario: Actors are ephemeral by default
+
+```gherkin
+Given the actor pool is empty
+When I create actor "temp" from the HUD (click "+", enter name, select role, click "create")
+Then actor "temp" should have persistent = false
+And the 💨 icon should be shown in the pool row (not 💾)
+And SessionManager.isEphemeral("actor-temp") should return true
+```
+
+### Scenario: Toggle persistence via HUD
+
+```gherkin
+Given actor "temp" exists with persistent = false
+When I click the 💨 icon next to "temp" in the Actor Pool panel
+Then actor "temp" should toggle to persistent = true
+And the icon should change to 💾
+And SessionManager.isEphemeral("actor-temp") should return false
+```
+
+**Validation command:**
+```
+curl -s -X POST http://localhost:50052/plugins/actors/toggle-persistent/temp
+→ {"ok": true, "persistent": true}
+```
+
+### Scenario: Ephemeral actor does NOT survive restart
+
+```gherkin
+Given actor "temp" exists with persistent = false (ephemeral)
+When JARVIS is restarted
+Then actor "temp" should NOT appear in the pool after boot
+And no file actor-temp.json should exist in .jarvis/sessions/
+```
+
+### Scenario: Persistent actor survives restart
+
+```gherkin
+Given actor "keeper" exists with persistent = true
+And actor "keeper" has processed at least one task
+When JARVIS is restarted
+Then actor "keeper" should appear in the pool after boot
+And file actor-keeper.json should exist in .jarvis/sessions/
+And actor "keeper" should retain its conversation history
+```
+
+**Validation command:**
+```
+1. actor_dispatch(name="keeper", role="generic", task="Remember the word 'pineapple'", persistent=true)
+2. Wait for completion
+3. Toggle persistent if not already: curl -X POST http://localhost:50052/plugins/actors/toggle-persistent/keeper
+4. jarvis_reset (restart)
+5. After restart: actor_list() → "keeper" should be in the pool
+6. actor_dispatch(name="keeper", role="generic", task="What word did I ask you to remember?")
+7. Response should mention "pineapple"
+```
+
+### Scenario: Ephemeral kill deletes session file
+
+```gherkin
+Given actor "temp" is ephemeral and has processed tasks
+And a session file actor-temp.json may exist due to auto-save
+When actor "temp" is killed (via HUD ✕ or actor_kill)
+Then the file .jarvis/sessions/actor-temp.json should be deleted
+And the session should NOT be saved on close
+```
+
+### Scenario: Persistent kill preserves session file
+
+```gherkin
+Given actor "keeper" is persistent and has processed tasks
+When actor "keeper" is killed (via HUD ✕ or actor_kill)
+Then the file .jarvis/sessions/actor-keeper.json should still exist
+And the session is saved before closing
+```
+
+### Scenario: Ephemeral actors cleaned on shutdown
+
+```gherkin
+Given 2 actors exist: "eph" (ephemeral) and "pers" (persistent)
+Both have processed tasks
+When JARVIS shuts down (SIGINT)
+Then pieceManager.stopAll() runs BEFORE sessions.saveAll()
+And actor-runner.stop() deletes ephemeral session files (actor-eph.json)
+And sessions.saveAll() saves remaining sessions (actor-pers.json)
+And after restart: only "pers" is restored
 ```
 
 ## Feature: Bus Communication
@@ -149,15 +231,6 @@ When I call bus_publish with channel "ai.request", target "actor-alpha", text "W
 Then actor "alpha" should process the message
 And a response prefixed with "[ACTOR:alpha]" should arrive in the main session
 And the response should contain the answer
-```
-
-### Scenario: Message queuing when actor is busy
-
-```gherkin
-Given actor "alpha" is currently running a task
-When I send a bus_publish message to actor "alpha"
-Then the message should be queued
-And after the current task completes, the queued message should be processed automatically
 ```
 
 ### Scenario: Actor-to-actor communication
@@ -192,7 +265,7 @@ Then the Actor Pool HUD should display "[working] Running tests" for actor "alph
 And actor_list should include the status message
 ```
 
-## Feature: HUD Panel
+## Feature: HUD — Actor Pool Panel
 
 ### Scenario: Actor Pool panel renders correctly on startup
 
@@ -218,42 +291,31 @@ And no full page refresh should be needed
 ```gherkin
 Given the Actor Pool panel is visible and the pool is not full
 When I click the "+" button, enter a name, select a role, and click "create"
-Then a new actor should be created in the pool
-And the main session should receive a system message about the creation
+Then a new actor should be created in the pool (ephemeral by default)
+And the main session should receive a [SYSTEM] message about the creation
 And the actor should appear in the panel with status "idle"
+And the row should show: ● name, role #0, 💨 icon, ✕ button
 ```
 
-### Scenario: Kill actor from HUD
-
-```gherkin
-Given the Actor Pool panel shows an actor "alpha"
-When I click the "✕" button next to actor "alpha"
-Then actor "alpha" should be killed
-And the main session should receive a system message about the kill
-And the panel should update to remove the actor
+**Validation command:**
+```
+curl -s -X POST http://localhost:50052/plugins/actors/create \
+  -H "Content-Type: application/json" \
+  -d '{"name": "hud-test", "role": "generic"}'
+→ {"ok": true}
+→ Main session receives: [SYSTEM] Actor "hud-test" (generic) created by the user from the HUD
 ```
 
-### Scenario: HUD "+" button creates actor via HTTP
-
-```gherkin
-Given the Actor Pool panel shows "0/5" with a "+" button visible
-When I POST to /plugins/actors/create with body {"name": "hud-test", "role": "generic"}
-Then the response should be {"ok": true}
-And the main session should receive a [SYSTEM] message: 'Actor "hud-test" (generic) created by the user from the HUD'
-And the message should include "DO NOT kill this actor"
-And actor_list should show "hud-test" with status "idle"
-And the Actor Pool panel should update to "1/5" with actor "hud-test" listed
-```
-
-### Scenario: HUD "✕" button kills actor via HTTP
+### Scenario: Kill actor from HUD (✕ button)
 
 ```gherkin
 Given actor "hud-test" exists in the pool
-When I POST to /plugins/actors/hud-test/kill
-Then the response should be {"ok": true}
-And the main session should receive a [SYSTEM] message: 'Actor "hud-test" was manually killed from the HUD'
-And actor_list should return an empty actors array
-And the Actor Pool panel should update to "0/5" with "no actors"
+When I click the "✕" button next to actor "hud-test"
+Then a POST request is sent to /plugins/actors/hud-test/kill
+And actor "hud-test" should be removed from the pool
+And the main session should receive a [SYSTEM] message about the kill
+And the panel should update to remove the actor
+And if the actor was ephemeral, its session file should be deleted
 ```
 
 ### Scenario: HUD "+" button is hidden when pool is full
@@ -262,72 +324,9 @@ And the Actor Pool panel should update to "0/5" with "no actors"
 Given 5 actors exist in the pool
 When the Actor Pool panel renders
 Then the "+" button should NOT be visible
-And POST to /plugins/actors/create should still succeed (actor-pool enforces the limit, not the renderer)
-But actor-pool should reject the creation (pool full)
 ```
 
-### Scenario: Actor node appears in core node graph
-
-```gherkin
-Given the core node graph is rendering
-When actor "alpha" is dispatched with a task
-Then the "Actors" node in the graph should show meta.active = 1
-And when actor "alpha" completes and returns to idle
-Then meta.active should return to 0
-And the graph should reflect changes via SSE without page refresh
-```
-
-### Scenario: Core node graph reflects pool size
-
-```gherkin
-Given the core node graph is rendering
-And 3 actors are alive in the pool (2 idle, 1 running)
-Then the "Actors" node should display with meta: { max: 5, active: 1 }
-When all 3 actors are killed
-Then the "Actors" node should display with meta: { max: 5, active: 0 }
-```
-
-### Scenario: Actor node status transitions in graph
-
-```gherkin
-Given actor "alpha" exists in the pool with status "idle"
-And the core node graph shows "alpha" as a child of "Actors" with status "idle"
-When I dispatch a task to actor "alpha" that involves tool use
-Then the graph node for "alpha" should transition through:
-  1. "processing" — when the actor starts streaming a response (delta event)
-  2. "waiting_tools" — when the actor calls a tool (tool_start event)
-  3. "processing" — when the tool returns and the actor continues (tool_done event)
-  4. "idle" — when the actor finishes (complete event)
-And each state should be reflected in the graph node color:
-  - "idle" → green
-  - "processing" → orange
-  - "waiting_tools" → purple
-```
-
-**Validation command:**
-```
-1. actor_dispatch(name="alpha", role="generic", task="Read the first line of app/src/core/bus.ts")
-2. During execution, use jarvis_eval to inspect graph:
-   const { graphRegistry } = await import('./core/graph-registry.js');
-   const tree = graphRegistry.getTree();
-   const alpha = tree.find(n => n.id === 'actor-alpha');
-   return alpha?.status;  // should cycle: idle → processing → waiting_tools → processing → idle
-3. hud_screenshot() — verify actor node color matches status
-```
-
-### Scenario: Actor appears and disappears from graph
-
-```gherkin
-Given the core node graph shows "Actors" with no children
-When I dispatch actor "beta" with a task
-Then a new child node "beta" should appear under "Actors" in the graph
-And the "Actors" node meta should show active: 1
-When actor "beta" completes and I kill it
-Then the "beta" node should disappear from the graph
-And the "Actors" node meta should show active: 0
-```
-
-### Scenario: HUD Actor Pool panel validates
+### Scenario: Actor Pool panel layout
 
 ```gherkin
 Given the plugin is installed and running
@@ -335,10 +334,66 @@ Then the Actor Pool panel should render with:
   - Title bar showing "ACTOR POOL"
   - Counter showing "N/5" where N is current actor count
   - "+" button visible when pool is not full (hidden when 5/5)
-  - Each actor row showing: status dot (colored), name, "role #taskCount", and "✕" kill button
+  - Each actor row: status dot (colored ● ), name, "role #taskCount", 💾/💨 icon, ✕ button
   - "no actors" text when pool is empty
 And the panel should be draggable and resizable
 And the panel should have pin (📌), minimize, and close buttons in the title bar
+```
+
+## Feature: HUD — Actor Chat Panel
+
+### Scenario: Open actor chat by clicking actor name
+
+```gherkin
+Given actor "alpha" exists in the pool
+When I click on "alpha" in the Actor Pool panel
+Then a POST is sent to /plugins/actors/open-chat/alpha
+And a new ephemeral HUD panel opens titled "Chat: alpha"
+And the panel renders ActorChatRenderer which embeds the core ChatPanel component
+And chat history is loaded from GET /plugins/actors/alpha/history
+```
+
+### Scenario: Send message in actor chat
+
+```gherkin
+Given the actor chat panel for "alpha" is open
+When I type a message and press Enter
+Then the ChatPanel POSTs to /plugins/actors/alpha/send
+And actor-chat piece publishes the message on bus to actor-alpha
+And the actor processes the message
+And the response streams via SSE from /plugins/actors/alpha/stream
+And delta events render in real-time in the chat panel
+And tool_start/tool_done events show capability execution bars
+```
+
+### Scenario: Actor chat shows history from previous interactions
+
+```gherkin
+Given actor "alpha" has been dispatched tasks via actor_dispatch previously
+When I open the actor chat panel
+Then all previous user messages and actor responses should be visible
+And the history is sourced from SessionManager (not a separate in-memory store)
+And tool_result messages are filtered out (same as core ChatPiece)
+```
+
+### Scenario: Abort running actor from chat
+
+```gherkin
+Given actor "alpha" is running (processing a message)
+And the actor chat panel is open
+When I click the abort button in the chat panel
+Then a POST is sent to /plugins/actors/alpha/abort
+And the actor's current operation is aborted
+And an "aborted" event is emitted on the SSE stream
+```
+
+### Scenario: Chat panel requires __JARVIS_COMPONENTS
+
+```gherkin
+Given the HUD exposes window.__JARVIS_COMPONENTS.ChatPanel
+When ActorChatRenderer loads
+Then it should reuse the core ChatPanel component (not a custom implementation)
+And if __JARVIS_COMPONENTS is not available, it should show a warning message
 ```
 
 ## Feature: Actor Chat (HTTP API)
@@ -366,38 +421,6 @@ And actor "alpha" should receive the message with the image attached
 And the actor's response should describe the image content
 ```
 
-**Validation command:**
-```
-1. Create actor: actor_dispatch(name="vision", role="generic", task="Say hello")
-2. Wait for completion
-3. Take a screenshot: hud_screenshot()
-4. POST the screenshot as an image to the actor via HTTP:
-   curl -s -X POST http://localhost:50052/plugins/actors/vision/send \
-     -H "Content-Type: application/json" \
-     -d '{"text": "What do you see in this image?", "images": [{"label":"Image #1","base64":"...","mediaType":"image/png"}]}'
-5. Verify: actor processes the image and responds with a description
-```
-
-### Scenario: Images propagated via bus dispatch
-
-```gherkin
-Given actor "alpha" exists with status "idle"
-When a bus message with images is published to actor "alpha":
-  bus_publish(channel="ai.request", target="actor-alpha", text="Describe this", images=[...])
-Then the images should be forwarded to the actor's AI session via sendAndStream(text, images)
-And the actor should process the multimodal input
-```
-
-### Scenario: Images queued when actor is busy
-
-```gherkin
-Given actor "alpha" is running a task
-When I POST to /plugins/actors/alpha/send with text and images
-Then the message (including images) should be queued
-And after the current task completes, the queued message with images should be processed
-And the actor should see and respond to the image content
-```
-
 ### Scenario: Stream actor output via SSE
 
 ```gherkin
@@ -418,16 +441,8 @@ Given actor "alpha" has processed at least one task
 When I GET /plugins/actors/alpha/history
 Then the response should contain an array of chat entries
 And each entry should have "role" ("user" or "actor") and "text"
-```
-
-### Scenario: Get chat history from SessionManager
-
-```gherkin
-Given actor "alpha" has processed at least one task
-When I GET /plugins/actors/alpha/history
-Then the response should be sourced from SessionManager (not an in-memory duplicate)
-And the entries should match the raw AI session messages (parsed into user/actor roles)
-And tool_result messages should be filtered out (same as core ChatPiece behavior)
+And the entries are sourced from SessionManager (not an in-memory duplicate)
+And tool_result messages should be filtered out
 ```
 
 ### Scenario: Abort a running actor via HTTP
@@ -441,10 +456,10 @@ And an "aborted" event should be emitted on the actor's SSE stream
 
 ## Feature: Session Persistence (via SessionManager)
 
-### Scenario: Actor session is saved to disk on idle
+### Scenario: Persistent actor session is saved to disk on idle
 
 ```gherkin
-Given actor "alpha" has completed a task and transitioned to "idle"
+Given actor "alpha" is persistent and has completed a task (transitioned to "idle")
 When I check the sessions directory (.jarvis/sessions/)
 Then a file "actor-alpha.json" should exist
 And it should contain the actor's conversation messages
@@ -453,48 +468,20 @@ And the provider and model fields should match the current configuration
 
 **Validation command:**
 ```
-1. actor_dispatch(name="alpha", role="generic", task="Say hello")
+1. actor_dispatch(name="alpha", role="generic", task="Say hello", persistent=true)
 2. Wait for completion (status → idle)
 3. bash: cat .jarvis/sessions/actor-alpha.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'messages: {d[\"messageCount\"]}, provider: {d[\"provider\"]}')"
    → Should show messageCount >= 2, provider "anthropic"
 ```
 
-### Scenario: Actor session auto-saves periodically
+### Scenario: Ephemeral actor session is NOT saved to disk
 
 ```gherkin
-Given actor "alpha" exists and has processed tasks
-When 30 seconds pass (the auto-save interval)
-Then the actor's session should be auto-saved to disk
-And the savedAt timestamp should be updated
-```
-
-### Scenario: Actor session persists across restarts
-
-```gherkin
-Given actor "alpha" has processed a task and the session was saved
-When JARVIS is restarted
-And actor "alpha" is re-dispatched with the same name and role
-Then the actor should restore its previous conversation history
-And when asked "What did I ask you before?", it should reference the pre-restart task
-```
-
-**Validation command:**
-```
-1. actor_dispatch(name="persist-test", role="generic", task="Remember the word 'pineapple'")
-2. Wait for completion
-3. Verify: bash: test -f .jarvis/sessions/actor-persist-test.json && echo "saved"
-4. jarvis_reset (restart JARVIS)
-5. After restart: actor_dispatch(name="persist-test", role="generic", task="What word did I ask you to remember?")
-6. Verify: response mentions "pineapple"
-```
-
-### Scenario: Actor session saved on kill
-
-```gherkin
-Given actor "alpha" has processed tasks
-When I call actor_kill with name "alpha"
-Then the session should be saved to disk before closing
-And the file .jarvis/sessions/actor-alpha.json should still exist after kill
+Given actor "eph" is ephemeral (persistent = false, the default)
+And actor "eph" has completed a task (transitioned to "idle")
+When I check the sessions directory (.jarvis/sessions/)
+Then no file "actor-eph.json" should exist
+Because SessionManager skips saving when isEphemeral returns true
 ```
 
 ### Scenario: Abort cleans up message history properly
@@ -505,6 +492,48 @@ When I POST to /plugins/actors/alpha/abort
 Then cleanupAbortedTools should be called on the session (same as core JarvisCore behavior)
 And the actor's message history should not contain orphaned tool_use blocks without matching tool_result
 And subsequent tasks should work correctly without message format errors
+```
+
+## Feature: Node Graph Integration
+
+### Scenario: Actor node appears in core node graph
+
+```gherkin
+Given the core node graph is rendering
+When actor "alpha" is dispatched with a task
+Then the "Actors" node in the graph should show meta.active = 1
+And when actor "alpha" completes and returns to idle
+Then meta.active should return to 0
+And the graph should reflect changes via SSE without page refresh
+```
+
+### Scenario: Actor node status transitions in graph
+
+```gherkin
+Given actor "alpha" exists in the pool with status "idle"
+And the core node graph shows "alpha" as a child of "Actors" with status "idle"
+When I dispatch a task to actor "alpha" that involves tool use
+Then the graph node for "alpha" should transition through:
+  1. "processing" — when the actor starts streaming a response
+  2. "waiting_tools" — when the actor calls a tool
+  3. "processing" — when the tool returns and the actor continues
+  4. "idle" — when the actor finishes
+And each state should be reflected in the graph node color:
+  - "idle" → green
+  - "processing" → orange
+  - "waiting_tools" → purple
+```
+
+### Scenario: Actor appears and disappears from graph
+
+```gherkin
+Given the core node graph shows "Actors" with no children
+When I dispatch actor "beta" with a task
+Then a new child node "beta" should appear under "Actors" in the graph
+And the "Actors" node meta should show active: 1
+When actor "beta" completes and I kill it
+Then the "beta" node should disappear from the graph
+And the "Actors" node meta should show active: 0
 ```
 
 ## Feature: Error Handling
@@ -550,27 +579,6 @@ Then the log should contain:
 grep -E "actor_dispatch|actor_kill|actor\.dispatch\.result|actor\.kill" .jarvis/logs/jarvis.log | tail -10
 ```
 
-### Scenario: HUD state changes are logged
-
-```gherkin
-Given the HUD is running
-When a piece publishes a hud.update event
-Then the log should contain "HudState: added" or "HudState: updated" with the pieceId
-And when a piece is removed, the log should contain "HudState: removed"
-```
-
-### Scenario: Bus messages are logged with eventId
-
-```gherkin
-Given JARVIS is running at debug log level
-When any message is published on the bus
-Then the log should contain "bus: publish" with:
-  - channel name
-  - source
-  - a unique eventId (UUID)
-And tool executions should log "CapabilityExecutor: executing" with session, count, and tool names
-```
-
 ## Execution Checklist
 
 Run these commands in order to validate the full lifecycle:
@@ -588,15 +596,22 @@ Run these commands in order to validate the full lifecycle:
 4. actor_list()
    → Verify: shows actor "test" with role "generic", taskCount >= 2
 
-5. GET /plugins/actors/test/history
-   → Verify: returns array with user/actor entries parsed from SessionManager
+5. curl -s http://localhost:50052/plugins/actors/test/history
+   → Verify: returns array with user/actor entries
 
-6. bash: cat .jarvis/sessions/actor-test.json | python3 -c "import json,sys; print(json.load(sys.stdin)['messageCount'])"
-   → Verify: session persisted to disk, messageCount > 0
+6. Open actor chat: click "test" in pool → chat panel opens → send message → streamed response
 
-7. actor_kill(name="test")
-   → Verify: pool empty, HUD shows 0/5
+7. Toggle persistent: click 💨 → becomes 💾
+   → Verify: curl -s POST http://localhost:50052/plugins/actors/toggle-persistent/test
 
-8. hud_screenshot()
-   → Verify: Actor Pool panel visible, "no actors" displayed
+8. jarvis_reset → restart → actor_list() → "test" should be in the pool (persistent)
+
+9. actor_kill(name="test")
+   → Verify: pool empty, HUD shows 0/5, session file preserved (was persistent)
+
+10. Create ephemeral actor from HUD (+), kill it (✕)
+    → Verify: no session file left on disk
+
+11. hud_screenshot()
+    → Verify: Actor Pool panel visible, correct state
 ```

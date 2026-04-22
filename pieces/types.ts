@@ -21,6 +21,8 @@ export interface Actor {
   chatHistory: Array<{ role: 'user' | 'actor'; text: string; source?: string }>;
   /** Self-reported status from actor_status tool calls */
   statusMessage?: string;
+  /** If true, session is persisted to disk and restored on boot. Default: false (ephemeral). */
+  persistent: boolean;
 }
 
 export interface ActorStatusEvent {

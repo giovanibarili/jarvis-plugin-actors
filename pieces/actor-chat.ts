@@ -137,9 +137,13 @@ export class ActorChatPiece implements Piece {
     if (action === "history") {
       res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
       const sessionId = `actor-${actorName}`;
+      // Check both in-memory AND on-disk sessions
       if (!this.sessions.has(sessionId)) {
-        res.end("[]");
-        return;
+        const saved = this.sessions.listSaved("actor-");
+        if (!saved.includes(sessionId)) {
+          res.end("[]");
+          return;
+        }
       }
       try {
         const managed = this.sessions.get(sessionId);
@@ -270,7 +274,9 @@ export class ActorChatPiece implements Piece {
     req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
     req.on("end", () => {
       try {
-        const { text, images } = JSON.parse(body) as { text: string; images?: any[] };
+        const parsed = JSON.parse(body) as { text?: string; prompt?: string; images?: any[] };
+        const text = parsed.text ?? parsed.prompt ?? "";
+        const images = parsed.images;
         this.broadcast(actorName, { type: "user", text, source: "you" });
         this.ensureSubscribed(actorName);
 

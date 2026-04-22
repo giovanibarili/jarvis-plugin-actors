@@ -113,6 +113,11 @@ export class ActorPoolPiece implements Piece {
         if (name) {
           const actor = this.actors.get(name);
           if (actor) {
+            // If not persistent, clear saved session file before killing
+            if (!actor.persistent) {
+              const sm = this.ctx.sessionManager;
+              if (sm) sm.clearSaved(`actor-${name}`);
+            }
             actor.status = "stopped";
             this.actors.delete(name);
             this.bus.publish({ channel: "system.event", source: this.id, event: "actor.kill", data: { name } });
@@ -123,9 +128,15 @@ export class ActorPoolPiece implements Piece {
       if (msg.event === "actor.create.request") {
         this.handleCreateRequest(msg);
       }
+      if (msg.event === "actor.chat.open") {
+        const name = msg.data?.name as string | undefined;
+        if (name) this.openActorChat(name);
+      }
     });
 
     this.registerCapabilities();
+    this.registerRoutes();
+    this.restoreSavedActorSessions();
 
     // Register graph children — show each actor as a child node of Actor Pool
     if (this.ctx.graphHandle) {
@@ -177,7 +188,8 @@ export class ActorPoolPiece implements Piece {
     if (!role) return;
     if (this.actors.size >= MAX_ACTORS) return;
 
-    const actor: Actor = { id: name, role, status: "idle", createdAt: Date.now(), taskCount: 0, replyTo: "main", chatHistory: [] };
+    const actor: Actor = { id: name, role, status: "idle", createdAt: Date.now(), taskCount: 0, replyTo: "main", chatHistory: [], persistent: false };
+    this.syncPersistence(actor);
     this.actors.set(name, actor);
     this.updateHud();
 
@@ -246,6 +258,7 @@ export class ActorPoolPiece implements Piece {
           name: { type: "string", description: "Actor name (e.g. 'alice', 'bob'). Same name = same session." },
           role: { type: "string", description: `Role for new actors: ${roleIds}.` },
           task: { type: "string", description: "The task description" },
+          persistent: { type: "boolean", description: "If true, session is saved to disk and restored on boot. Default: false (ephemeral)." },
         },
         required: ["name", "role", "task"],
       },
@@ -254,6 +267,7 @@ export class ActorPoolPiece implements Piece {
         const name = String(input.name);
         const roleId = String(input.role);
         const task = String(input.task);
+        const persistent = input.persistent === true;
 
         let actor = this.actors.get(name);
         if (actor) {
@@ -266,8 +280,9 @@ export class ActorPoolPiece implements Piece {
           if (!role) return { ok: false, error: `Unknown role: ${roleId}. Available: ${this.roles.map(r => r.id).join(', ')}` };
           if (this.actors.size >= MAX_ACTORS) return { ok: false, error: `Pool full (${this.actors.size}/${MAX_ACTORS}).` };
 
-          actor = { id: name, role, status: "idle", createdAt: Date.now(), taskCount: 0, replyTo: sessionId, chatHistory: [] };
+          actor = { id: name, role, status: "idle", createdAt: Date.now(), taskCount: 0, replyTo: sessionId, chatHistory: [], persistent };
           this.actors.set(name, actor);
+          this.syncPersistence(actor);
         }
 
         actor.currentTask = task;
@@ -398,6 +413,128 @@ export class ActorPoolPiece implements Piece {
     });
   }
 
+  /** Sync the actor's persistent flag to SessionManager ephemeral state */
+  private syncPersistence(actor: Actor): void {
+    const sm = this.ctx.sessionManager;
+    if (!sm) return;
+    const sessionId = `actor-${actor.id}`;
+    // ephemeral = NOT persistent
+    sm.setEphemeral(sessionId, !actor.persistent);
+  }
+
+  /** Toggle persistence for an actor (called from HUD or HTTP) */
+  private togglePersistence(name: string): boolean | null {
+    const actor = this.actors.get(name);
+    if (!actor) return null;
+    actor.persistent = !actor.persistent;
+    this.syncPersistence(actor);
+    // If toggling OFF persistence, clear the saved session file
+    if (!actor.persistent) {
+      const sm = this.ctx.sessionManager;
+      if (sm) sm.clearSaved(`actor-${name}`);
+    }
+    this.updateHud();
+    return actor.persistent;
+  }
+
+  /**
+   * Restore actors from saved sessions on disk.
+   * SessionManager.listSaved("actor-") returns all persisted actor session labels.
+   * For each, we need to figure out which role it had — stored in the session's conversation
+   * metadata. If we can't determine the role, use generic as fallback.
+   */
+  private restoreSavedActorSessions(): void {
+    const sm = this.ctx.sessionManager;
+    if (!sm) return;
+    const savedActors = sm.listSaved("actor-");
+    if (savedActors.length === 0) return;
+
+    for (const sessionId of savedActors) {
+      const name = sessionId.replace("actor-", "");
+      if (this.actors.has(name)) continue;
+      if (this.actors.size >= MAX_ACTORS) break;
+
+      // Default to generic role — the session has the conversation history,
+      // and the role context was already baked into the system prompt at creation time
+      const role = this.roles.find(r => r.id === "generic") ?? this.roles[0];
+      if (!role) continue;
+
+      const actor: Actor = {
+        id: name, role, status: "idle", createdAt: Date.now(),
+        taskCount: 0, replyTo: "main", chatHistory: [], persistent: true,
+      };
+      this.actors.set(name, actor);
+      // Mark session persistence AFTER actor is in the map (syncPersistence needs sessionManager)
+      this.syncPersistence(actor);
+
+      // Tell actor-runner to create the AI session (will restore conversation from disk)
+      this.bus.publish({
+        channel: "system.event",
+        source: this.id,
+        event: "actor.session.create",
+        data: { name, role },
+      });
+    }
+    if (this.actors.size > 0) this.updateHud();
+  }
+
+  /** Open an actor chat panel in the HUD */
+  private openActorChat(name: string): void {
+    const actor = this.actors.get(name);
+    if (!actor) return;
+    const chatPieceId = `actor-chat-${name}`;
+    this.bus.publish({
+      channel: "hud.update",
+      source: this.id,
+      action: "add",
+      pieceId: chatPieceId,
+      piece: {
+        pieceId: chatPieceId,
+        type: "panel",
+        name: `Chat: ${name}`,
+        status: "running",
+        data: { actorName: name, actorRole: actor.role.id },
+        position: { x: 100, y: 100 },
+        size: { width: 480, height: 400 },
+        ephemeral: true,
+        renderer: { plugin: "jarvis-plugin-actors", file: "ActorChatRenderer" },
+      },
+    });
+  }
+
+  private registerRoutes(): void {
+    // Route: POST /plugins/actors/open-chat/<name>
+    this.ctx.registerRoute("POST", "/plugins/actors/open-chat/", (req: any, res: any) => {
+      const name = req.url?.split("/plugins/actors/open-chat/")[1]?.split("?")[0];
+      if (!name) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "Missing actor name" }));
+        return;
+      }
+      this.openActorChat(name);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+    });
+
+    // Route: POST /plugins/actors/toggle-persistent/<name>
+    this.ctx.registerRoute("POST", "/plugins/actors/toggle-persistent/", (req: any, res: any) => {
+      const name = req.url?.split("/plugins/actors/toggle-persistent/")[1]?.split("?")[0];
+      if (!name) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "Missing actor name" }));
+        return;
+      }
+      const result = this.togglePersistence(name);
+      if (result === null) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: `Actor not found: ${name}` }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, persistent: result }));
+    });
+  }
+
   private getData(): Record<string, unknown> {
     const actors = [...this.actors.values()];
     return {
@@ -405,7 +542,7 @@ export class ActorPoolPiece implements Piece {
       total: actors.length,
       active: actors.filter(a => a.status === "running" || a.status === "waiting_tools").length,
       idle: actors.filter(a => a.status === "idle").length,
-      actors: actors.map(a => ({ id: a.id, role: a.role.id, status: a.status, tasks: a.taskCount, statusMessage: a.statusMessage })),
+      actors: actors.map(a => ({ id: a.id, role: a.role.id, status: a.status, tasks: a.taskCount, statusMessage: a.statusMessage, persistent: a.persistent })),
       roles: this.roles.map(r => ({ id: r.id, name: r.name, description: r.description })),
     };
   }
