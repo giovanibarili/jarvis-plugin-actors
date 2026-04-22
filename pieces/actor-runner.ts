@@ -169,6 +169,7 @@ export class ActorRunnerPiece implements Piece {
 
     const managed = this.sessions.get(actorSessionId);
     this.sessions.setState(actorSessionId, "processing");
+    this.publishStateChange(name, "running");
 
     let fullText = "";
     let capabilityRounds = 0;
@@ -207,6 +208,7 @@ export class ActorRunnerPiece implements Piece {
                 });
                 this.publishStatus(name, "aborted");
                 this.sessions.setState(actorSessionId, "idle");
+                this.publishStateChange(name, "idle");
                 return;
               }
               this.bus.publish({
@@ -218,6 +220,7 @@ export class ActorRunnerPiece implements Piece {
               });
               this.publishResult(name, `Error: ${event.error}`, replyTo);
               this.sessions.setState(actorSessionId, "idle");
+              this.publishStateChange(name, "idle");
               return;
           }
         }
@@ -227,6 +230,7 @@ export class ActorRunnerPiece implements Piece {
         if (capabilityCalls.length > 0) {
           capabilityRounds++;
           this.sessions.setState(actorSessionId, "waiting_tools");
+          this.publishStateChange(name, "waiting_tools");
 
           for (const call of capabilityCalls) {
             this.bus.publish({
@@ -264,6 +268,7 @@ export class ActorRunnerPiece implements Piece {
 
           managed.session.addToolResults(capabilityCalls, results);
           this.sessions.setState(actorSessionId, "processing");
+          this.publishStateChange(name, "running");
           stream = managed.session.continueAndStream();
           continue;
         }
@@ -273,6 +278,7 @@ export class ActorRunnerPiece implements Piece {
 
       // Complete — set idle (triggers auto-save)
       this.sessions.setState(actorSessionId, "idle");
+      this.publishStateChange(name, "idle");
 
       // Complete event for actor chat UI
       this.bus.publish({
@@ -286,8 +292,18 @@ export class ActorRunnerPiece implements Piece {
       this.publishResult(name, fullText, replyTo);
     } catch (err) {
       this.sessions.setState(actorSessionId, "idle");
+      this.publishStateChange(name, "idle");
       this.publishResult(name, `Crashed: ${err}`, replyTo);
     }
+  }
+
+  private publishStateChange(name: string, state: string): void {
+    this.bus.publish({
+      channel: "system.event",
+      source: "actor-runner",
+      event: "actor.state.change",
+      data: { name, state },
+    });
   }
 
   private publishStatus(name: string, status: string): void {

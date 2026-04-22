@@ -9,6 +9,7 @@ import type {
   CapabilityDefinition,
   CapabilityHandler,
   EventBus,
+  GraphHandle,
 } from "@jarvis/core";
 
 export class ActorPoolPiece implements Piece {
@@ -21,6 +22,7 @@ export class ActorPoolPiece implements Piece {
   private roles: ActorRole[];
   private started = false;
   private unsubDispatchResult?: () => void;
+  private graphHandle?: GraphHandle;
 
   private static readonly ROLES_DIR = join(process.env.HOME ?? "~", ".jarvis", "roles");
 
@@ -105,6 +107,7 @@ export class ActorPoolPiece implements Piece {
     this.unsubDispatchResult = this.bus.subscribe<SystemEventMessage>("system.event", (msg) => {
       if (msg.event === "actor.status") this.handleActorStatus(msg);
       if (msg.event === "actor.dispatch.result") this.handleDispatchResult(msg);
+      if (msg.event === "actor.state.change") this.handleStateChange(msg);
       if (msg.event === "actor.kill.request") {
         const name = msg.data?.name as string | undefined;
         if (name) {
@@ -123,6 +126,12 @@ export class ActorPoolPiece implements Piece {
     });
 
     this.registerCapabilities();
+
+    // Register graph children — show each actor as a child node of Actor Pool
+    if (this.ctx.graphHandle) {
+      this.graphHandle = this.ctx.graphHandle(this.id);
+      this.updateGraph();
+    }
 
     this.bus.publish({
       channel: "hud.update",
@@ -144,6 +153,9 @@ export class ActorPoolPiece implements Piece {
 
   async stop(): Promise<void> {
     this.unsubDispatchResult?.();
+    if (this.graphHandle) {
+      this.graphHandle.setChildren(undefined);
+    }
     this.actors.clear();
     this.bus.publish({
       channel: "hud.update",
@@ -184,6 +196,19 @@ export class ActorPoolPiece implements Piece {
       target: "main",
       text: `[SYSTEM] Actor "${name}" (${role.id}) created by the user from the HUD and is idle in the pool. DO NOT kill this actor — it was manually created by the user.`,
     });
+  }
+
+  private handleStateChange(msg: SystemEventMessage): void {
+    const name = msg.data?.name as string | undefined;
+    const state = msg.data?.state as string | undefined;
+    if (!name || !state) return;
+    const actor = this.actors.get(name);
+    if (!actor) return;
+    // Map runner states to actor status
+    if (state === "running") actor.status = "running";
+    else if (state === "waiting_tools") actor.status = "waiting_tools";
+    else if (state === "idle") actor.status = "idle";
+    this.updateHud();
   }
 
   private handleActorStatus(msg: SystemEventMessage): void {
@@ -393,6 +418,23 @@ export class ActorPoolPiece implements Piece {
       pieceId: this.id,
       data: this.getData(),
       status: [...this.actors.values()].some(a => a.status === "running") ? "processing" : "running",
+    });
+    this.updateGraph();
+  }
+
+  private updateGraph(): void {
+    if (!this.graphHandle) return;
+    const actors = [...this.actors.values()];
+    const active = actors.filter(a => a.status === "running" || a.status === "waiting_tools").length;
+    this.graphHandle.update({ meta: { max: MAX_ACTORS, active } });
+    this.graphHandle.setChildren(() => {
+      if (this.actors.size === 0) return [];
+      return [...this.actors.values()].map(a => ({
+        id: `actor-${a.id}`,
+        label: a.id,
+        status: a.status === "running" ? "processing" : a.status === "waiting_tools" ? "waiting_tools" : a.status === "idle" ? "running" : a.status,
+        meta: { role: a.role.id, tasks: a.taskCount },
+      }));
     });
   }
 }
