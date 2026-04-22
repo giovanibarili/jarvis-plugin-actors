@@ -258,7 +258,7 @@ export class ActorRunnerPiece implements Piece {
             });
           }
 
-          // Inject sessionId so capabilities (like skill_invoke) know the calling actor
+          // Inject sessionId so capabilities know the calling actor
           const enrichedCalls = capabilityCalls.map(c => ({
             ...c,
             input: { ...(c.input as Record<string, unknown>), __sessionId: actorSessionId },
