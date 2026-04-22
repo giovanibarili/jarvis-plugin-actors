@@ -2,6 +2,10 @@
 
 Persistent AI actor pool for JARVIS. Create named actors with roles that maintain conversation memory across tasks. Actors execute autonomously with tool access and report results back to the main session.
 
+## Requirements
+
+- **JARVIS** ≥ 0.1.0 (`@jarvis/core` ≥ 0.1.0)
+
 ## Install
 
 Ask JARVIS:
