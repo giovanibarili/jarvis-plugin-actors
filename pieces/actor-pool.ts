@@ -478,7 +478,15 @@ export class ActorPoolPiece implements Piece {
     if (this.actors.size > 0) this.updateHud();
   }
 
-  /** Open an actor chat panel in the HUD */
+  /**
+   * Open an actor chat panel in the HUD.
+   *
+   * The panel declares `renderer: { plugin: null, file: "ChatPanel" }` — the
+   * core ChatPanelHudAdapter resolves it from window.__JARVIS_COMPONENTS.
+   * Session identity is passed opaquely as `data.sessionId`. The actor plugin
+   * is the only place that decides the "actor-<name>" naming convention —
+   * core jarvis-app knows nothing about "actor" as a concept.
+   */
   private openActorChat(name: string): void {
     const actor = this.actors.get(name);
     if (!actor) return;
@@ -493,11 +501,14 @@ export class ActorPoolPiece implements Piece {
         type: "panel",
         name: `Chat: ${name}`,
         status: "running",
-        data: { actorName: name, actorRole: actor.role.id },
+        data: {
+          sessionId: `actor-${name}`,
+          assistantLabel: name.toUpperCase(),
+        },
         position: { x: 100, y: 100 },
         size: { width: 480, height: 400 },
         ephemeral: true,
-        renderer: { plugin: "jarvis-plugin-actors", file: "ActorChatRenderer" },
+        renderer: { plugin: null, file: "ChatPanel" },
       },
     });
   }
@@ -532,6 +543,63 @@ export class ActorPoolPiece implements Piece {
       }
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true, persistent: result }));
+    });
+
+    // Route: POST /plugins/actors/create — spawn a new actor
+    // Body: { name, role }
+    // Chat endpoints (send/stream/history/abort) were removed in favour of the
+    // core sessionId-aware /chat/* endpoints.
+    this.ctx.registerRoute("POST", "/plugins/actors/create", (req: any, res: any) => {
+      let body = "";
+      req.on("data", (chunk: Buffer) => { body += chunk.toString(); });
+      req.on("end", () => {
+        try {
+          const { name, role } = JSON.parse(body) as { name: string; role: string };
+          if (!name || !role) {
+            res.writeHead(400, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "name and role are required" }));
+            return;
+          }
+          this.bus.publish({
+            channel: "system.event",
+            source: this.id,
+            event: "actor.create.request",
+            data: { name, roleId: role },
+          });
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (e) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ ok: false, error: String(e) }));
+        }
+      });
+    });
+
+    // Route: POST /plugins/actors/<name>/kill — administrative lifecycle
+    this.ctx.registerRoute("POST", "/plugins/actors/", (req: any, res: any) => {
+      // Match /plugins/actors/<name>/kill — other paths already handled above
+      const match = req.url?.match(/^\/plugins\/actors\/([^/]+)\/kill$/);
+      if (!match) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "Not found" }));
+        return;
+      }
+      const name = match[1];
+      this.bus.publish({
+        channel: "system.event",
+        source: this.id,
+        event: "actor.kill.request",
+        data: { name },
+      });
+      // Notify main chat that a manual kill happened, matching prior behaviour
+      this.bus.publish({
+        channel: "ai.request",
+        source: "system",
+        target: "main",
+        text: `[SYSTEM] Actor "${name}" was manually killed from the HUD.`,
+      });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
     });
   }
 
