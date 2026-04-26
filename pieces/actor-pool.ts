@@ -2,6 +2,7 @@ import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join, basename } from "node:path";
 import type { Actor, ActorRole, ActorDispatchResultEvent, ActorReportedStatus, ActorStatusEvent } from "./types.js";
 import { BUILT_IN_ROLES, MAX_ACTORS } from "./types.js";
+import { readActorMeta, writeActorMeta, deleteActorMeta } from "./actor-meta.js";
 import type {
   Piece,
   PluginContext,
@@ -79,24 +80,16 @@ export class ActorPoolPiece implements Piece {
   }
 
   systemContext(): string {
-    const parts: string[] = [];
-
-    // Active actors (dynamic state)
-    const actorEntries = [...this.actors.values()];
-    if (actorEntries.length > 0) {
-      const actorList = actorEntries
-        .map(a => `- ${a.id} (${a.role.id}): ${a.status}, ${a.taskCount} tasks done`)
-        .join('\n');
-      parts.push(`### Active Actors\n${actorList}`);
-    }
-
-    // Available roles (dynamic — loaded from ~/.jarvis/roles/)
-    if (this.roles.length > 0) {
-      const roleList = this.roles.map(r => `- ${r.id}: ${r.description}`).join('\n');
-      parts.push(`### Available Roles\n${roleList}`);
-    }
-
-    return parts.length > 0 ? parts.join('\n\n') : '';
+    // IMPORTANT: do NOT inject Active Actors here — the active-actor list changes
+    // every time an actor is created/killed, which would invalidate the BP1
+    // plugin-dynamic-context cache on every mutation. Instead, create/kill events
+    // are surfaced to the main session as `[SYSTEM] <reminder>...</reminder>` chat
+    // messages (see handleCreateRequest and the actor_kill capability handler).
+    // Available Roles is stable across an entire JARVIS run (loaded once from
+    // ~/.jarvis/roles/) so it stays in the system prompt safely.
+    if (this.roles.length === 0) return '';
+    const roleList = this.roles.map(r => `- ${r.id}: ${r.description}`).join('\n');
+    return `### Available Roles\n${roleList}`;
   }
 
   async start(bus: EventBus): Promise<void> {
@@ -118,6 +111,8 @@ export class ActorPoolPiece implements Piece {
               const sm = this.ctx.sessionManager;
               if (sm) sm.clearSaved(`actor-${name}`);
             }
+            // Kill always removes the meta sidecar — the actor no longer exists.
+            deleteActorMeta(name);
             actor.status = "stopped";
             this.actors.delete(name);
             this.bus.publish({ channel: "system.event", source: this.id, event: "actor.kill", data: { name } });
@@ -191,6 +186,7 @@ export class ActorPoolPiece implements Piece {
     const actor: Actor = { id: name, role, status: "idle", createdAt: Date.now(), taskCount: 0, replyTo: "main", chatHistory: [], persistent: false };
     this.syncPersistence(actor);
     this.actors.set(name, actor);
+    // Manual-created actors start ephemeral — no meta file until toggled persistent.
     this.updateHud();
 
     // Tell actor-runner to create the AI session (dispatch with no real task — just init)
@@ -201,12 +197,13 @@ export class ActorPoolPiece implements Piece {
       data: { name, role },
     });
 
-    // Notify JARVIS main session
+    // Notify JARVIS main session via a reminder tag (kept out of the system
+    // prompt to preserve the BP1 cache — see systemContext() note).
     this.bus.publish({
       channel: "ai.request",
       source: "system",
       target: "main",
-      text: `[SYSTEM] Actor "${name}" (${role.id}) created by the user from the HUD and is idle in the pool. DO NOT kill this actor — it was manually created by the user.`,
+      text: `[SYSTEM] <reminder>Actor "${name}" (role: ${role.id}) was created by the user from the HUD and is now idle in the pool. DO NOT kill this actor — it was manually created by the user.</reminder>`,
     });
   }
 
@@ -283,6 +280,9 @@ export class ActorPoolPiece implements Piece {
           actor = { id: name, role, status: "idle", createdAt: Date.now(), taskCount: 0, replyTo: sessionId, chatHistory: [], persistent };
           this.actors.set(name, actor);
           this.syncPersistence(actor);
+          if (persistent) {
+            writeActorMeta(name, { roleId: role.id, persistent: true, createdAt: actor.createdAt });
+          }
         }
 
         actor.currentTask = task;
@@ -332,6 +332,12 @@ export class ActorPoolPiece implements Piece {
         const name = String(input.name);
         const actor = this.actors.get(name);
         if (!actor) return { ok: false, error: `Actor not found: ${name}` };
+        // Kill always removes the meta sidecar; clearSaved only if actor was persistent.
+        if (actor.persistent) {
+          const sm = this.ctx.sessionManager;
+          if (sm) sm.clearSaved(`actor-${name}`);
+        }
+        deleteActorMeta(name);
         actor.status = "stopped";
         this.actors.delete(name);
         this.bus.publish({ channel: "system.event", source: this.id, event: "actor.kill", data: { name } });
@@ -428,10 +434,17 @@ export class ActorPoolPiece implements Piece {
     if (!actor) return null;
     actor.persistent = !actor.persistent;
     this.syncPersistence(actor);
-    // If toggling OFF persistence, clear the saved session file
-    if (!actor.persistent) {
+    if (actor.persistent) {
+      // Toggled ON — persist the meta sidecar so the role survives restart.
+      // Force an immediate session save so the meta and session file appear together.
+      writeActorMeta(name, { roleId: actor.role.id, persistent: true, createdAt: actor.createdAt });
+      const sm = this.ctx.sessionManager;
+      if (sm) sm.save(`actor-${name}`);
+    } else {
+      // Toggled OFF — clear both the saved session file and the meta sidecar.
       const sm = this.ctx.sessionManager;
       if (sm) sm.clearSaved(`actor-${name}`);
+      deleteActorMeta(name);
     }
     this.updateHud();
     return actor.persistent;
@@ -439,9 +452,12 @@ export class ActorPoolPiece implements Piece {
 
   /**
    * Restore actors from saved sessions on disk.
+   *
    * SessionManager.listSaved("actor-") returns all persisted actor session labels.
-   * For each, we need to figure out which role it had — stored in the session's conversation
-   * metadata. If we can't determine the role, use generic as fallback.
+   * For each, we read the sidecar `actor-<name>.meta.json` to recover the role id
+   * the actor was originally created with. If the meta is missing or points to an
+   * unknown role, we fall back to `generic` (and log the drift) — but persisted
+   * actors should always have a meta written by createRequest/dispatch/toggle.
    */
   private restoreSavedActorSessions(): void {
     const sm = this.ctx.sessionManager;
@@ -454,18 +470,35 @@ export class ActorPoolPiece implements Piece {
       if (this.actors.has(name)) continue;
       if (this.actors.size >= MAX_ACTORS) break;
 
-      // Default to generic role — the session has the conversation history,
-      // and the role context was already baked into the system prompt at creation time
-      const role = this.roles.find(r => r.id === "generic") ?? this.roles[0];
+      const meta = readActorMeta(name);
+      const genericRole = this.roles.find(r => r.id === "generic") ?? this.roles[0];
+      let role: ActorRole | undefined;
+      if (meta) {
+        role = this.roles.find(r => r.id === meta.roleId);
+        if (!role) {
+          console.warn(`[actor-pool] meta for "${name}" points to unknown role "${meta.roleId}"; falling back to generic`);
+          role = genericRole;
+        }
+      } else {
+        // Legacy actor saved before meta support — fall back and re-write the meta
+        // so next restore is clean.
+        console.warn(`[actor-pool] no meta sidecar for persisted actor "${name}"; defaulting to generic role`);
+        role = genericRole;
+      }
       if (!role) continue;
 
+      const createdAt = meta?.createdAt ?? Date.now();
       const actor: Actor = {
-        id: name, role, status: "idle", createdAt: Date.now(),
+        id: name, role, status: "idle", createdAt,
         taskCount: 0, replyTo: "main", chatHistory: [], persistent: true,
       };
       this.actors.set(name, actor);
       // Mark session persistence AFTER actor is in the map (syncPersistence needs sessionManager)
       this.syncPersistence(actor);
+      // Back-fill the meta if it was missing so we don't warn again next boot.
+      if (!meta) {
+        writeActorMeta(name, { roleId: role.id, persistent: true, createdAt });
+      }
 
       // Tell actor-runner to create the AI session (will restore conversation from disk)
       this.bus.publish({
@@ -591,12 +624,13 @@ export class ActorPoolPiece implements Piece {
         event: "actor.kill.request",
         data: { name },
       });
-      // Notify main chat that a manual kill happened, matching prior behaviour
+      // Notify main chat that a manual kill happened (reminder tag — see
+      // systemContext() note about keeping actor list out of the system prompt).
       this.bus.publish({
         channel: "ai.request",
         source: "system",
         target: "main",
-        text: `[SYSTEM] Actor "${name}" was manually killed from the HUD.`,
+        text: `[SYSTEM] <reminder>Actor "${name}" was manually killed from the HUD and removed from the pool.</reminder>`,
       });
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true }));

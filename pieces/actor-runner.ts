@@ -1,7 +1,9 @@
 import { readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, basename } from "node:path";
+import { readdirSync } from "node:fs";
 import type { ActorRole } from "./types.js";
-import { MAX_CAPABILITY_ROUNDS } from "./types.js";
+import { BUILT_IN_ROLES, MAX_CAPABILITY_ROUNDS } from "./types.js";
+import { readActorMeta } from "./actor-meta.js";
 import type {
   Piece,
   PluginContext,
@@ -50,6 +52,47 @@ export class ActorRunnerPiece implements Piece {
     return `## Your Role: ${role.name}\n\n${role.systemPrompt}`;
   }
 
+  /**
+   * Resolve the role for a persisted actor on lazy-create.
+   *
+   * Reads the sidecar `actor-<name>.meta.json` to discover the roleId, then:
+   *  1. If there's a matching `~/.jarvis/roles/<roleId>.md` file, parses it.
+   *  2. Else falls back to BUILT_IN_ROLES by id.
+   *  3. Else falls back to the "generic" built-in.
+   *
+   * Returns null only if there's no generic fallback available (should never happen).
+   */
+  private resolveActorRole(name: string): ActorRole | null {
+    const meta = readActorMeta(name);
+    const roleId = meta?.roleId ?? "generic";
+
+    // Try ~/.jarvis/roles/<roleId>.md first
+    const rolesDir = join(process.env.HOME ?? "~", ".jarvis", "roles");
+    try {
+      const files = readdirSync(rolesDir).filter(f => f.endsWith(".md"));
+      const match = files.find(f => basename(f, ".md") === roleId);
+      if (match) {
+        const content = readFileSync(join(rolesDir, match), "utf-8");
+        const m = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+        if (m) {
+          const fm = m[1];
+          const body = m[2].trim();
+          const nameMatch = fm.match(/^name:\s*(.+)$/m);
+          const descMatch = fm.match(/^description:\s*(.+)$/m);
+          if (nameMatch && descMatch && body) {
+            return { id: roleId, name: nameMatch[1].trim(), description: descMatch[1].trim(), systemPrompt: body };
+          }
+        }
+      }
+    } catch {
+      // dir missing or unreadable — fall through
+    }
+
+    // Fall back to built-ins by id, then to generic
+    const builtin = BUILT_IN_ROLES.find(r => r.id === roleId) ?? BUILT_IN_ROLES.find(r => r.id === "generic");
+    return builtin ?? null;
+  }
+
   async start(bus: EventBus): Promise<void> {
     if (this.started) return;
     this.started = true;
@@ -73,8 +116,14 @@ export class ActorRunnerPiece implements Piece {
           // Check if there's a saved session on disk (persistent actor restored by pool)
           const savedSessions = this.sessions.listSaved("actor-");
           if (!savedSessions.includes(sessionId)) return;
-          // Lazy-create with generic role — conversation history will be restored from disk
-          this.getOrCreateSession(name, { id: "generic", name: "Generic Worker", description: "", systemPrompt: "You are a worker agent for JARVIS. Execute tasks given to you autonomously. Use the available tools as needed. Be thorough and report your results clearly." });
+          // Resolve role from the meta sidecar so we don't silently downgrade
+          // persistent actors to the generic role on restart.
+          const role = this.resolveActorRole(name);
+          if (!role) {
+            console.error(`[actor-runner] cannot resolve role for "${name}" and no generic fallback available`);
+            return;
+          }
+          this.getOrCreateSession(name, role);
         }
         if (msg.source === "actor-pool" || msg.source === `actor-${name}`) return;
         if (this.running.has(name)) {
