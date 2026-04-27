@@ -2,7 +2,10 @@ import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { join, basename } from "node:path";
 import type { Actor, ActorRole, ActorDispatchResultEvent, ActorReportedStatus, ActorStatusEvent } from "./types.js";
 import { BUILT_IN_ROLES, MAX_ACTORS } from "./types.js";
-import { readActorMeta, writeActorMeta, deleteActorMeta } from "./actor-meta.js";
+import {
+  readActorMeta, writeActorMeta, deleteActorMeta,
+  migrateLegacyMetaSidecars,
+} from "./actor-meta.js";
 import type {
   Piece,
   PluginContext,
@@ -131,6 +134,20 @@ export class ActorPoolPiece implements Piece {
 
     this.registerCapabilities();
     this.registerRoutes();
+
+    // Migrate any legacy `actor-<name>.meta.json` sidecars (which the core
+    // session scanner mistook for new sessions, causing a `.meta.meta…`
+    // cascade) into `sessions/actor-pool-meta/<name>.json`. Also cleans up
+    // phantom session/meta files left behind by previous boots.
+    try {
+      const { migrated, cleaned } = migrateLegacyMetaSidecars();
+      if (migrated > 0 || cleaned > 0) {
+        console.log(`[actor-pool] meta migration: migrated=${migrated} cleaned=${cleaned}`);
+      }
+    } catch (err) {
+      console.warn("[actor-pool] meta migration failed (non-fatal):", err);
+    }
+
     this.restoreSavedActorSessions();
 
     // Register graph children — show each actor as a child node of Actor Pool
@@ -467,6 +484,11 @@ export class ActorPoolPiece implements Piece {
 
     for (const sessionId of savedActors) {
       const name = sessionId.replace("actor-", "");
+      // Defense in depth: never resurrect a phantom session label whose name
+      // contains `.meta` — those are legacy sidecar artifacts, not actors.
+      // The migration step at start() should have removed them, but guard
+      // anyway in case a sidecar survives in the sessions root.
+      if (!name || name.includes(".meta")) continue;
       if (this.actors.has(name)) continue;
       if (this.actors.size >= MAX_ACTORS) break;
 

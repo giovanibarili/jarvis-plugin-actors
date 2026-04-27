@@ -615,3 +615,43 @@ Run these commands in order to validate the full lifecycle:
 11. hud_screenshot()
     → Verify: Actor Pool panel visible, correct state
 ```
+
+## Meta sidecar isolation (regression — `.meta` cascade)
+
+Sidecars are stored in `app/.jarvis/sessions/actor-pool-meta/<name>.json`,
+NOT alongside session files. This prevents the core `listSavedSessions()`
+filter (`*.json`) from picking them up as new actor session labels and
+spawning phantom `<name>.meta`, `<name>.meta.meta`, … actors on every boot.
+
+12. Create persistent actor "alpha" (e.g. `actor_dispatch(name="alpha", role="generic", task="hi", persistent=true)`)
+    → Verify: file exists at `app/.jarvis/sessions/actor-pool-meta/alpha.json`
+    → Verify: NO file `app/.jarvis/sessions/actor-alpha.meta.json` is created
+
+13. jarvis_reset → restart → `actor_list()`
+    → Verify: only one entry for "alpha" — no "alpha.meta" or "alpha.meta.meta" phantoms
+
+14. Legacy migration:
+    a. With JARVIS stopped, drop a fake legacy sidecar at
+       `app/.jarvis/sessions/actor-legacy.meta.json` containing
+       `{"roleId":"generic","persistent":true,"createdAt":1700000000000}`
+    b. Drop a phantom cascade artifact `actor-legacy.meta.meta.json`
+       (contents irrelevant — it should be deleted)
+    c. Start JARVIS
+    → Verify: `app/.jarvis/sessions/actor-legacy.meta.json` is gone
+    → Verify: `app/.jarvis/sessions/actor-pool-meta/legacy.json` exists with original content
+    → Verify: `app/.jarvis/sessions/actor-legacy.meta.meta.json` is gone (cleaned)
+    → Verify: log line `[actor-pool] meta migration: migrated=1 cleaned=1`
+
+15. Defense in depth — phantom session label rejected:
+    a. With JARVIS stopped, drop a phantom session
+       `app/.jarvis/sessions/actor-phantom.meta.json` with shape
+       `{"messages":[]}` (looks like a session, not a sidecar)
+    b. Start JARVIS
+    → Verify: actor list does NOT contain "phantom.meta"
+    → Verify: phantom file is removed (cleaned during migration)
+
+16. Idempotency:
+    a. Start JARVIS twice in a row with no actors
+    → Verify: `actor-pool-meta/` directory exists but is empty (or only contains
+       sidecars for surviving persistent actors)
+    → Verify: no log spam about migration on second start (`migrated=0 cleaned=0`)
