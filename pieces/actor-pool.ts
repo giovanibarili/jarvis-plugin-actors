@@ -214,14 +214,8 @@ export class ActorPoolPiece implements Piece {
       data: { name, role },
     });
 
-    // Notify JARVIS main session via a reminder tag (kept out of the system
-    // prompt to preserve the BP1 cache — see systemContext() note).
-    this.bus.publish({
-      channel: "ai.request",
-      source: "system",
-      target: "main",
-      text: `[SYSTEM] <reminder>Actor "${name}" (role: ${role.id}) was created by the user from the HUD and is now idle in the pool. DO NOT kill this actor — it was manually created by the user.</reminder>`,
-    });
+    // Manual create from HUD — no reminder injected into main. The actor
+    // panel itself is the visible feedback; main doesn't need a prompt.
   }
 
   private handleStateChange(msg: SystemEventMessage): void {
@@ -646,14 +640,8 @@ export class ActorPoolPiece implements Piece {
         event: "actor.kill.request",
         data: { name },
       });
-      // Notify main chat that a manual kill happened (reminder tag — see
-      // systemContext() note about keeping actor list out of the system prompt).
-      this.bus.publish({
-        channel: "ai.request",
-        source: "system",
-        target: "main",
-        text: `[SYSTEM] <reminder>Actor "${name}" was manually killed from the HUD and removed from the pool.</reminder>`,
-      });
+      // Manual kill from HUD — no reminder injected into main. The actor
+      // panel disappearing is the visible feedback.
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
     });

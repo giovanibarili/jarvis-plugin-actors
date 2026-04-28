@@ -127,11 +127,22 @@ export class ActorRunnerPiece implements Piece {
         }
         if (msg.source === "actor-pool" || msg.source === `actor-${name}`) return;
         if (this.running.has(name)) {
-          // Queue the message for when the actor finishes
+          // Queue the message for when the actor finishes. Emit pending_queue
+          // so the chat panel renders a queue card. NEVER emit prompt_dispatched
+          // here — that happens later, when drainQueue actually sends it.
           if (!this.queues.has(name)) this.queues.set(name, []);
           this.queues.get(name)!.push({ text: msg.text, replyTo: msg.replyTo, images: (msg as any).images });
+          this.broadcastPendingQueue(name);
           return;
         }
+        // Idle path — about to dispatch immediately. Emit prompt_dispatched
+        // so the chat panel renders the user entry NOW (mirrors
+        // JarvisCore's contract for owned sessions).
+        this.broadcastPromptDispatched(name, [{
+          text: msg.text,
+          source: msg.source,
+          images: (msg as any).images,
+        }]);
         this.running.add(name);
         this.runTask(name, msg.text, msg.replyTo, (msg as any).images).finally(() => this.drainQueue(name));
       }
@@ -194,8 +205,16 @@ export class ActorRunnerPiece implements Piece {
     if (this.running.has(name)) {
       if (!this.queues.has(name)) this.queues.set(name, []);
       this.queues.get(name)!.push({ text: task, replyTo, images });
+      this.broadcastPendingQueue(name);
       return;
     }
+    // Idle path — dispatching immediately. Emit prompt_dispatched so the
+    // chat panel renders the user entry NOW.
+    this.broadcastPromptDispatched(name, [{
+      text: task,
+      source: msg.source,
+      images,
+    }]);
     this.running.add(name);
     this.runTask(name, task, replyTo, images).finally(() => this.drainQueue(name));
   }
@@ -204,12 +223,67 @@ export class ActorRunnerPiece implements Piece {
     const queue = this.queues.get(name);
     if (queue && queue.length > 0) {
       const next = queue.shift()!;
-      // Still running — process next queued message
+      // About to dispatch the queued message — emit prompt_dispatched so
+      // it migrates from QUEUED card to a `type:"user"` timeline entry,
+      // and refresh the pending_queue snapshot (one less item now).
+      this.broadcastPromptDispatched(name, [{
+        text: next.text,
+        source: "chat",
+        images: next.images,
+      }]);
+      this.broadcastPendingQueue(name);
       this.runTask(name, next.text, next.replyTo, next.images).finally(() => this.drainQueue(name));
     } else {
-      // Nothing left — mark as not running
+      // Nothing left — mark as not running, broadcast empty queue so
+      // ChatPanel clears any lingering cards.
       this.running.delete(name);
+      this.broadcastPendingQueue(name);
     }
+  }
+
+  /**
+   * Emit `ai.stream` event `pending_queue` carrying a snapshot of the
+   * actor's queue. Mirrors JarvisCore.broadcastPendingQueue exactly so
+   * ChatPanel renders identical cards regardless of who owns the session.
+   * Text is truncated to 280 chars to keep the SSE payload small.
+   */
+  private broadcastPendingQueue(name: string): void {
+    const sessionId = `actor-${name}`;
+    const queue = this.queues.get(name) ?? [];
+    const items = queue.map(q => ({
+      text: (q.text ?? "").slice(0, 280),
+      source: "chat",
+      hasImages: !!q.images?.length,
+    }));
+    this.bus.publish({
+      channel: "ai.stream",
+      source: name,
+      target: sessionId,
+      event: "pending_queue",
+      items,
+    } as any);
+  }
+
+  /**
+   * Emit `ai.stream` event `prompt_dispatched` carrying the items that
+   * are about to be sent to the AI. ChatPiece expands each item into a
+   * `type:"user"` SSE entry. Mirrors JarvisCore.broadcastPromptDispatched
+   * — contract: a session owner emits this when a prompt actually goes
+   * to the model, which is the UX moment for the timeline entry.
+   */
+  private broadcastPromptDispatched(
+    name: string,
+    items: Array<{ text: string; source?: string; images?: any[] }>,
+  ): void {
+    if (items.length === 0) return;
+    const sessionId = `actor-${name}`;
+    this.bus.publish({
+      channel: "ai.stream",
+      source: name,
+      target: sessionId,
+      event: "prompt_dispatched",
+      items: items.map(i => ({ text: i.text, source: i.source, images: i.images })),
+    } as any);
   }
 
   private getOrCreateSession(name: string, role: ActorRole): ManagedSession {
@@ -259,6 +333,21 @@ export class ActorRunnerPiece implements Piece {
               break;
             case "tool_use":
               if (event.toolUse) capabilityCalls.push(event.toolUse as CapabilityCall);
+              break;
+            case "retry":
+              // Transient API error → session is going to retry. Forward
+              // the retry banner over ai.stream so the actor's chat panel
+              // shows "Retrying (n/10, ~Xs)…" until the next text_delta
+              // (success) or terminal event.
+              if ((event as any).retry) {
+                this.bus.publish({
+                  channel: "ai.stream",
+                  source: name,
+                  target: actorSessionId,
+                  event: "retry",
+                  retry: (event as any).retry,
+                } as any);
+              }
               break;
             case "error":
               if (event.error === "aborted") {
