@@ -42,24 +42,25 @@ export class ActorPoolPiece implements Piece {
    * Role ID = filename without extension.
    */
   private loadRoles(): ActorRole[] {
+    // Start with builtins — user roles from ~/.jarvis/roles/ are merged on top.
+    // User role with same ID as a builtin overrides it entirely (user wins).
+    const byId = new Map<string, ActorRole>(BUILT_IN_ROLES.map(r => [r.id, r]));
+
     const dir = ActorPoolPiece.ROLES_DIR;
-    if (!existsSync(dir)) return [...BUILT_IN_ROLES];
-
-    const files = readdirSync(dir).filter(f => f.endsWith(".md"));
-    if (files.length === 0) return [...BUILT_IN_ROLES];
-
-    const roles: ActorRole[] = [];
-    for (const file of files) {
-      try {
-        const content = readFileSync(join(dir, file), "utf-8");
-        const role = this.parseRoleFile(file, content);
-        if (role) roles.push(role);
-      } catch {
-        // skip malformed files
+    if (existsSync(dir)) {
+      const files = readdirSync(dir).filter(f => f.endsWith(".md"));
+      for (const file of files) {
+        try {
+          const content = readFileSync(join(dir, file), "utf-8");
+          const role = this.parseRoleFile(file, content);
+          if (role) byId.set(role.id, role); // user wins on conflict
+        } catch {
+          // skip malformed files
+        }
       }
     }
 
-    return roles.length > 0 ? roles : [...BUILT_IN_ROLES];
+    return [...byId.values()];
   }
 
   private parseRoleFile(filename: string, content: string): ActorRole | null {
@@ -74,12 +75,45 @@ export class ActorPoolPiece implements Piece {
 
     if (!nameMatch || !descMatch || !body) return null;
 
-    return {
+    const role: ActorRole = {
       id: basename(filename, ".md"),
       name: nameMatch[1].trim(),
       description: descMatch[1].trim(),
       systemPrompt: body,
     };
+
+    // Optional: model — must be a FULL model id (no aliases).
+    // Aliases like "sonnet"/"opus"/"haiku" are silently ignored: they were the
+    // legacy convention for this field but never honored at runtime, so we
+    // accept them without crashing and just don't apply a sticky override.
+    const modelMatch = frontmatter.match(/^model:\s*(.+)$/m);
+    if (modelMatch) {
+      const value = modelMatch[1].trim();
+      // Heuristic: full model ids contain a hyphen and a version suffix.
+      // Aliases ("sonnet", "opus", "haiku") are short single tokens.
+      if (/^(claude|gpt|o[34])-/.test(value)) {
+        role.model = value;
+      }
+      // else: alias like "sonnet" — ignored on purpose. Future: warn via log.
+    }
+
+    // Optional: tools — supports YAML inline arrays
+    //   tools_allow: [tool_a, tool_b]
+    //   tools_block: [bash, jarvis_eval]
+    // Use flat keys (no nested YAML) so we don't need a real YAML parser.
+    const allowMatch = frontmatter.match(/^tools_allow:\s*\[(.*)\]$/m);
+    const blockMatch = frontmatter.match(/^tools_block:\s*\[(.*)\]$/m);
+    if (allowMatch || blockMatch) {
+      role.tools = {};
+      if (allowMatch) {
+        role.tools.allow = allowMatch[1].split(",").map(s => s.trim()).filter(Boolean);
+      }
+      if (blockMatch) {
+        role.tools.block = blockMatch[1].split(",").map(s => s.trim()).filter(Boolean);
+      }
+    }
+
+    return role;
   }
 
   systemContext(): string {
@@ -109,12 +143,14 @@ export class ActorPoolPiece implements Piece {
         if (name) {
           const actor = this.actors.get(name);
           if (actor) {
-            // If not persistent, clear saved session file before killing
-            if (!actor.persistent) {
+            // Kill from HUD (X button) — wipe saved session JSON and meta sidecar
+            // immediately, regardless of persistent flag. The actor no longer exists.
+            // (actor-runner.killSession also clears ephemeral saves, but won't touch
+            // persistent ones — that's the pool's job here.)
+            if (actor.persistent) {
               const sm = this.ctx.sessionManager;
               if (sm) sm.clearSaved(`actor-${name}`);
             }
-            // Kill always removes the meta sidecar — the actor no longer exists.
             deleteActorMeta(name);
             actor.status = "stopped";
             this.actors.delete(name);
@@ -278,21 +314,27 @@ export class ActorPoolPiece implements Piece {
         const persistent = input.persistent === true;
 
         let actor = this.actors.get(name);
+        const newRole = this.roles.find(r => r.id === roleId);
+        if (!newRole) return { ok: false, error: `Unknown role: ${roleId}. Available: ${this.roles.map(r => r.id).join(', ')}` };
+
         if (actor) {
           if (actor.status === "running" || actor.status === "waiting_tools") {
             return { ok: false, error: `Actor '${name}' is busy (${actor.status}).` };
           }
           actor.replyTo = sessionId;
+          // Update role if it changed — re-dispatch with a different role switches
+          // model + tool surface for subsequent tasks on the same session.
+          if (actor.role.id !== roleId) {
+            actor.role = newRole;
+          }
         } else {
-          const role = this.roles.find(r => r.id === roleId);
-          if (!role) return { ok: false, error: `Unknown role: ${roleId}. Available: ${this.roles.map(r => r.id).join(', ')}` };
           if (this.actors.size >= MAX_ACTORS) return { ok: false, error: `Pool full (${this.actors.size}/${MAX_ACTORS}).` };
 
-          actor = { id: name, role, status: "idle", createdAt: Date.now(), taskCount: 0, replyTo: sessionId, chatHistory: [], persistent };
+          actor = { id: name, role: newRole, status: "idle", createdAt: Date.now(), taskCount: 0, replyTo: sessionId, chatHistory: [], persistent };
           this.actors.set(name, actor);
           this.syncPersistence(actor);
           if (persistent) {
-            writeActorMeta(name, { roleId: role.id, persistent: true, createdAt: actor.createdAt });
+            writeActorMeta(name, { roleId: newRole.id, persistent: true, createdAt: actor.createdAt });
           }
         }
 

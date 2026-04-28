@@ -216,7 +216,7 @@ export class ActorRunnerPiece implements Piece {
       images,
     }]);
     this.running.add(name);
-    this.runTask(name, task, replyTo, images).finally(() => this.drainQueue(name));
+    this.runTask(name, task, replyTo, images, role).finally(() => this.drainQueue(name));
   }
 
   private async drainQueue(name: string): Promise<void> {
@@ -290,17 +290,67 @@ export class ActorRunnerPiece implements Piece {
     const sessionId = `actor-${name}`;
     this.activeSessions.add(name);
     if (this.sessions.has(sessionId)) {
-      return this.sessions.get(sessionId);
+      // Existing session: re-apply role-derived overrides every time we touch
+      // it. The role can change between dispatches (caller may pass a different
+      // role for the same actor name) and we want the latest to win.
+      const managed = this.sessions.get(sessionId);
+      this.applyRoleOverrides(managed, role);
+      return managed;
     }
 
-    return this.sessions.getWithPrompt(sessionId, {
+    const managed = this.sessions.getWithPrompt(sessionId, {
       label: sessionId,
       basePromptOverride: this.actorSystemPrompt,
       roleContext: this.buildRoleContext(role),
     });
+    this.applyRoleOverrides(managed, role);
+    return managed;
   }
 
-  private async runTask(name: string, task: string, replyTo?: string, images?: any[]): Promise<void> {
+  /**
+   * Apply role-derived per-session overrides:
+   *  - `role.model` → sticky model override (full model id only; aliases are
+   *    filtered upstream in actor-pool.parseRoleFile).
+   *  - `role.tools.allow / role.tools.block` → tool filter installed on the
+   *    session. The filter is consulted on every API call.
+   *
+   * Both overrides are NO-OPs if the underlying provider doesn't support them
+   * (the AISession methods are optional). Silent fallback is correct here:
+   * roles are advisory — the actor still runs, just with the global model
+   * and the full tool surface.
+   */
+  private applyRoleOverrides(managed: ManagedSession, role: ActorRole): void {
+    const session = managed.session;
+
+    if (role.model && typeof session.setStickyModelOverride === "function") {
+      session.setStickyModelOverride(role.model);
+    } else if (!role.model && typeof session.setStickyModelOverride === "function") {
+      // Role has no model — clear any previous override (e.g. from a prior
+      // dispatch with a different role).
+      session.setStickyModelOverride(undefined);
+    }
+
+    if (typeof session.setToolFilter === "function") {
+      const allow = role.tools?.allow;
+      const block = role.tools?.block;
+      if ((allow !== undefined) || (block && block.length > 0)) {
+        // allow present (even empty []) = explicit whitelist; null = no restriction.
+        // allow:[] means "block everything" — the Set is empty so nothing passes.
+        const allowSet = allow !== undefined ? new Set(allow) : null;
+        const blockSet = block && block.length > 0 ? new Set(block) : null;
+        session.setToolFilter((toolName: string) => {
+          if (allowSet && !allowSet.has(toolName)) return false;
+          if (blockSet && blockSet.has(toolName)) return false;
+          return true;
+        });
+      } else {
+        // No restrictions — ensure any previous filter is cleared.
+        session.setToolFilter(undefined);
+      }
+    }
+  }
+
+  private async runTask(name: string, task: string, replyTo?: string, images?: any[], role?: ActorRole): Promise<void> {
     const actorSessionId = `actor-${name}`;
     if (!this.sessions.has(actorSessionId)) return;
 
@@ -377,7 +427,12 @@ export class ActorRunnerPiece implements Piece {
           }
         }
 
-        if (!this.sessions.has(actorSessionId)) return; // killed
+        if (!this.sessions.has(actorSessionId)) {
+          // Session was killed mid-loop (e.g. actor called actor_kill on itself).
+          // Still publish whatever text was accumulated so the result isn't lost.
+          if (fullText) this.publishResult(name, fullText, replyTo);
+          return;
+        }
 
         if (capabilityCalls.length > 0) {
           capabilityRounds++;
@@ -442,6 +497,9 @@ export class ActorRunnerPiece implements Piece {
       });
 
       this.publishResult(name, fullText, replyTo);
+
+      // autoKill: one-shot roles (e.g. reader) clean themselves up after delivery.
+      if (role.autoKill) this.killSession(name);
     } catch (err) {
       this.sessions.setState(actorSessionId, "idle");
       this.publishStateChange(name, "idle");
