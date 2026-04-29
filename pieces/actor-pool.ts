@@ -385,11 +385,11 @@ export class ActorPoolPiece implements Piece {
         const name = String(input.name);
         const actor = this.actors.get(name);
         if (!actor) return { ok: false, error: `Actor not found: ${name}` };
-        // Kill always removes the meta sidecar; clearSaved only if actor was persistent.
-        if (actor.persistent) {
-          const sm = this.ctx.sessionManager;
-          if (sm) sm.clearSaved(`actor-${name}`);
-        }
+        const sm = this.ctx.sessionManager;
+        // Always archive+clear saved file (persistent or not)
+        if (sm) sm.archiveSaved(`actor-${name}`);
+        // Always close the in-memory session if it exists
+        if (sm) sm.close(`actor-${name}`);
         deleteActorMeta(name);
         actor.status = "stopped";
         this.actors.delete(name);
@@ -453,16 +453,45 @@ export class ActorPoolPiece implements Piece {
         required: ["channel", "target", "text"],
       },
       handler: (async (input: Record<string, unknown>) => {
+        // __sessionId is the caller's label ("main", "actor-alice", etc).
+        // Use it directly as source so the timeline shows the real originator
+        // instead of the hardcoded "jarvis" fallback which made every non-actor
+        // call appear as "YOU" in the target panel.
         const caller = input.__sessionId ? String(input.__sessionId) : "unknown";
-        const source = caller.startsWith("actor-") ? caller : "jarvis";
         const channel = String(input.channel);
         const target = String(input.target);
         const text = String(input.text);
         // reply_to is a session ID string — pass it directly as replyTo
         const replyTo = input.reply_to ? String(input.reply_to) : undefined;
+
+        // Validate that target session exists. Without this, bus_publish
+        // silently no-ops — the bus accepts the message but no subscriber
+        // is listening for a dead session. Fail loud so the caller can react.
+        const sm = this.ctx.sessionManager;
+        const sessionExists = (id: string) => sm ? sm.has(id) : true;
+        const activeSessions = () => sm
+          ? [...(sm as any).sessions?.keys?.() ?? []].sort()
+          : [];
+
+        if (!sessionExists(target)) {
+          const available = activeSessions();
+          return {
+            ok: false,
+            error: `Session not found: '${target}'. ${available.length > 0 ? `Active sessions: ${available.join(", ")}` : "No sessions are active."} Use actor_dispatch to create an actor, or verify the session ID.`,
+          };
+        }
+
+        if (replyTo && !sessionExists(replyTo)) {
+          const available = activeSessions();
+          return {
+            ok: false,
+            error: `reply_to session not found: '${replyTo}'. ${available.length > 0 ? `Active sessions: ${available.join(", ")}` : "No sessions are active."}`,
+          };
+        }
+
         this.bus.publish({
           channel: channel as "ai.request",
-          source,
+          source: caller,
           target,
           text,
           replyTo,

@@ -354,6 +354,16 @@ export class ActorRunnerPiece implements Piece {
     const actorSessionId = `actor-${name}`;
     if (!this.sessions.has(actorSessionId)) return;
 
+    // Fix B: callers via ai.request / drainQueue don't pass `role`.
+    // Resolve from the meta sidecar so post-task cleanup (e.g. autoKill)
+    // doesn't crash on `role.autoKill`. Warn if neither path yields a role.
+    if (!role) {
+      role = this.resolveActorRole(name) ?? undefined;
+      if (!role) {
+        console.warn(`[actor-runner] runTask("${name}"): role unresolved — autoKill check will be skipped`);
+      }
+    }
+
     const managed = this.sessions.get(actorSessionId);
     this.sessions.setState(actorSessionId, "processing");
     this.publishStateChange(name, "running");
@@ -499,7 +509,8 @@ export class ActorRunnerPiece implements Piece {
       this.publishResult(name, fullText, replyTo);
 
       // autoKill: one-shot roles (e.g. reader) clean themselves up after delivery.
-      if (role.autoKill) this.killSession(name);
+      // Fix A: defensive optional-chain in case role couldn't be resolved.
+      if (role?.autoKill) this.killSession(name);
     } catch (err) {
       this.sessions.setState(actorSessionId, "idle");
       this.publishStateChange(name, "idle");
