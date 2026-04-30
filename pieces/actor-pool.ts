@@ -113,6 +113,12 @@ export class ActorPoolPiece implements Piece {
       }
     }
 
+    // Optional: autoKill — if true, actor session is destroyed after each task completes.
+    const autoKillMatch = frontmatter.match(/^autoKill:\s*(.+)$/m);
+    if (autoKillMatch && autoKillMatch[1].trim() === "true") {
+      role.autoKill = true;
+    }
+
     return role;
   }
 

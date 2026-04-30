@@ -80,7 +80,14 @@ export class ActorRunnerPiece implements Piece {
           const nameMatch = fm.match(/^name:\s*(.+)$/m);
           const descMatch = fm.match(/^description:\s*(.+)$/m);
           if (nameMatch && descMatch && body) {
-            return { id: roleId, name: nameMatch[1].trim(), description: descMatch[1].trim(), systemPrompt: body };
+            const autoKillMatch = fm.match(/^autoKill:\s*(.+)$/m);
+            return {
+              id: roleId,
+              name: nameMatch[1].trim(),
+              description: descMatch[1].trim(),
+              systemPrompt: body,
+              autoKill: autoKillMatch?.[1]?.trim() === "true",
+            };
           }
         }
       }
@@ -567,5 +574,12 @@ export class ActorRunnerPiece implements Piece {
     this.queues.delete(name);
     this.running.delete(name);
     this.activeSessions.delete(name);
+    // Notify actor-pool to remove the actor from its registry
+    this.bus.publish({
+      channel: "system.event",
+      source: "actor-runner",
+      event: "actor.kill.request",
+      data: { name },
+    });
   }
 }
