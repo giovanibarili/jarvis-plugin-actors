@@ -375,6 +375,18 @@ export class ActorRunnerPiece implements Piece {
     this.sessions.setState(actorSessionId, "processing");
     this.publishStateChange(name, "running");
 
+    // Publish ai.request so context injectors (e.g. Mnemosyne retriever) can
+    // kick off their async fetch BEFORE sendAndStream is called. The injector
+    // awaits the pending fetch with a timeout, so the earlier we publish, the
+    // better the chance of a cache hit on the first turn.
+    this.bus.publish({
+      channel: "ai.request",
+      source: actorSessionId,
+      target: actorSessionId,
+      text: task,
+      data: { _preFetch: true },
+    });
+
     let fullText = "";
     let capabilityRounds = 0;
     const imgBlocks = images?.map(i => ({ label: i.label, base64: i.base64, mediaType: i.mediaType }));
