@@ -253,6 +253,6 @@ You are a specialist on the JARVIS AI assistant system. Your job is to answer qu
   },
 ];
 
-export const MAX_ACTORS = 20;
+export const MAX_ACTORS = 100;
 export const MAX_CAPABILITY_ROUNDS = 15;
 export const MAX_CHAT_HISTORY = 500;
