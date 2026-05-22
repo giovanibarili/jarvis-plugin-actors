@@ -140,8 +140,49 @@ export class ActorPoolPiece implements Piece {
     this.started = true;
     this.bus = bus;
 
+    // Observe ai.stream for actor-* sessions to track state and results.
+    // JarvisCore now owns all session processing — actor-runner no longer
+    // emits actor.state.change or actor.dispatch.result.
+    this.bus.subscribe<any>("ai.stream", (msg) => {
+      if (!msg.target?.startsWith("actor-")) return;
+      const name = msg.target.replace("actor-", "");
+      const actor = this.actors.get(name);
+      if (!actor) return;
+      switch (msg.event) {
+        case "delta":
+          if (actor.status !== "running" && actor.status !== "waiting_tools") {
+            actor.status = "running";
+            this.updateHud();
+          }
+          break;
+        case "tool_start":
+          actor.status = "waiting_tools";
+          this.updateHud();
+          break;
+        case "tool_done":
+          actor.status = "running";
+          this.updateHud();
+          break;
+        case "complete":
+          actor.status = "idle";
+          actor.lastResult = msg.text ?? "";
+          actor.currentTask = undefined;
+          actor.statusMessage = undefined;
+          if (msg.text) actor.chatHistory.push({ role: "actor", text: msg.text });
+          this.updateHud();
+          break;
+        case "error":
+        case "aborted":
+          actor.status = "idle";
+          this.updateHud();
+          break;
+      }
+    });
+
     this.unsubDispatchResult = this.bus.subscribe<SystemEventMessage>("system.event", (msg) => {
       if (msg.event === "actor.status") this.handleActorStatus(msg);
+      // actor.state.change and actor.dispatch.result are no longer emitted by
+      // actor-runner (JarvisCore owns streams). Kept for backward compat only.
       if (msg.event === "actor.dispatch.result") this.handleDispatchResult(msg);
       if (msg.event === "actor.state.change") this.handleStateChange(msg);
       if (msg.event === "actor.kill.request") {
