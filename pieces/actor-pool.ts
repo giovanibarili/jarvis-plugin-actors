@@ -515,7 +515,11 @@ export class ActorPoolPiece implements Piece {
         // silently no-ops — the bus accepts the message but no subscriber
         // is listening for a dead session. Fail loud so the caller can react.
         const sm = this.ctx.sessionManager;
-        const sessionExists = (id: string) => sm ? sm.has(id) : true;
+        // "main" is ALWAYS legitimate: it is created on demand by design (it
+        // owns the default system prompt). After a restart it may not be in
+        // the SessionManager yet — rejecting it here would break actor→main
+        // notifications until the user sends the first message.
+        const sessionExists = (id: string) => id === "main" || (sm ? sm.has(id) : true);
         const activeSessions = () => sm
           ? [...(sm as any).sessions?.keys?.() ?? []].sort()
           : [];
