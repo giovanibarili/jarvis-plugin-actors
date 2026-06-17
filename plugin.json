@@ -8,10 +8,5 @@
   "capabilities": {
     "pieces": true,
     "renderers": true
-  },
-  "install": {
-    "roles": [
-      "actor-system.md"
-    ]
   }
 }
