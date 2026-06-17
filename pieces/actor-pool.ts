@@ -209,8 +209,8 @@ export class ActorPoolPiece implements Piece {
         name: this.name,
         status: "running",
         data: this.getData(),
-        position: { x: 1680, y: 350 },
-        size: { width: 240, height: 120 },
+        position: { x: 1455, y: 534 },
+        size: { width: 362, height: 458 },
         renderer: { plugin: "jarvis-plugin-actors", file: "ActorPoolRenderer" },
       },
     });
