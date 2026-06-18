@@ -301,13 +301,13 @@ export class ActorPoolPiece implements Piece {
 
     this.ctx.capabilityRegistry.register({
       name: "actor_dispatch",
-      description: "Send a task to a named actor. If the actor exists, reuses its session (keeps memory). If new, creates one. The actor runs autonomously and reports back when done.",
+      description: "Persistent AI actor pool — delegate tasks to autonomous agents with memory. Creates or reuses a named session with the given role. After creation, use bus_publish to send tasks.",
       input_schema: {
         type: "object",
         properties: {
           name: { type: "string", description: "Actor name (e.g. 'alice', 'bob'). Same name = same session." },
           role: { type: "string", description: `Role for new actors: ${roleIds}.` },
-          task: { type: "string", description: "The task description" },
+          task: { type: "string", description: "The task description (sent immediately after session is ready)" },
           persistent: { type: "boolean", description: "If true, session is saved to disk and restored on boot. Default: false (ephemeral)." },
         },
         required: ["name", "role", "task"],
@@ -333,10 +333,8 @@ export class ActorPoolPiece implements Piece {
           if (persistent) writeActorMeta(name, { roleId: newRole.id, persistent: true, createdAt: actor.createdAt });
         }
 
-        // Signal actor-runner to create/reuse the session with the correct role
-        // and system prompt. actor-runner replies with actor.session.ready carrying
-        // the confirmed sessionId + system prompt summary.
-        const ready = await new Promise<{ sessionId: string; role: string; systemPromptPreview: string }>((resolve) => {
+        // Create/reuse session — actor-runner replies with actor.session.ready
+        const ready = await new Promise<{ sessionId: string; role: string }>((resolve) => {
           const unsub = this.bus.subscribe<SystemEventMessage>("system.event", (msg) => {
             if (msg.event === "actor.session.ready" && (msg.data as any)?.name === name) {
               unsub();
@@ -349,31 +347,17 @@ export class ActorPoolPiece implements Piece {
             event: "actor.session.create",
             data: { name, role: newRole },
           });
-          // Safety timeout — 2s
-          setTimeout(() => { unsub(); resolve({ sessionId: `actor-${name}`, role: roleId, systemPromptPreview: "(timeout)" }); }, 2000);
+          setTimeout(() => { unsub(); resolve({ sessionId: `actor-${name}`, role: roleId }); }, 2000);
         });
 
-        // Now send the task via ai.request — SessionDispatcher processes it
-        actor.chatHistory.push({ role: 'user', text: task, source: 'jarvis' });
-        actor.taskCount++;
-        actor.currentTask = task;
-        actor.replyTo = sessionId;
         this.updateHud();
-
-        this.bus.publish({
-          channel: "ai.request",
-          source: sessionId,
-          target: `actor-${name}`,
-          replyTo: sessionId,
-          text: task,
-        } as Parameters<EventBus["publish"]>[0]);
 
         return {
           ok: true,
           actorId: name,
           sessionId: ready.sessionId,
           role: ready.role,
-          systemPromptPreview: ready.systemPromptPreview,
+          hint: `Session ready. Use bus_publish(channel: "ai.request", target: "${ready.sessionId}", text: "<task>", reply_to: "${sessionId}") to send tasks.`,
         };
       }) as CapabilityHandler,
     });
