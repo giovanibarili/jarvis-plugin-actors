@@ -307,16 +307,14 @@ export class ActorPoolPiece implements Piece {
         properties: {
           name: { type: "string", description: "Actor name (e.g. 'alice', 'bob'). Same name = same session." },
           role: { type: "string", description: `Role for new actors: ${roleIds}.` },
-          task: { type: "string", description: "The task description (sent immediately after session is ready)" },
           persistent: { type: "boolean", description: "If true, session is saved to disk and restored on boot. Default: false (ephemeral)." },
         },
-        required: ["name", "role", "task"],
+        required: ["name", "role"],
       },
       handler: (async (input: Record<string, unknown>) => {
         const sessionId = input.__sessionId ? String(input.__sessionId) : "main";
         const name = String(input.name);
         const roleId = String(input.role);
-        const task = String(input.task);
         const persistent = input.persistent === true;
 
         let actor = this.actors.get(name);
