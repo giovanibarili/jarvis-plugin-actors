@@ -2,7 +2,7 @@
 // React hooks (useState, useRef, useEffect, etc.) are injected by the esbuild banner
 // from window.__JARVIS_REACT — do NOT import or destructure React manually.
 
-const ACTOR_BASE = 'http://localhost:50052/plugins/actors'
+const ACTOR_BASE = '/plugins/actors'
 
 export default function ActorPoolRenderer({ state }: { state: any }) {
   const data = state.data as any
