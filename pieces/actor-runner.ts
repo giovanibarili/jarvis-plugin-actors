@@ -2,16 +2,13 @@ import { readFileSync, existsSync } from "node:fs";
 import { join, basename } from "node:path";
 import { readdirSync } from "node:fs";
 import type { ActorRole } from "./types.js";
-import { BUILT_IN_ROLES, MAX_CAPABILITY_ROUNDS } from "./types.js";
+import { BUILT_IN_ROLES } from "./types.js";
 import { readActorMeta } from "./actor-meta.js";
 import type {
   Piece,
   PluginContext,
-  AIStreamEvent,
   AIRequestMessage,
   SystemEventMessage,
-  CapabilityCall,
-  CapabilityResult,
   EventBus,
   SessionManager,
   ManagedSession,
@@ -29,9 +26,7 @@ export class ActorRunnerPiece implements Piece {
   private bus!: EventBus;
   private ctx: PluginContext;
   private sessions!: SessionManager;
-  private running = new Set<string>();
   private activeSessions = new Set<string>(); // all actor names with live sessions
-  private queues = new Map<string, Array<{ text: string; replyTo?: string; images?: any[] }>>();
   private actorSystemPrompt: string;
   private started = false;
   private unsubDispatch?: () => void;
@@ -110,21 +105,22 @@ export class ActorRunnerPiece implements Piece {
     }
     this.sessions = this.ctx.sessionManager;
 
+    // Subscribe only to actor-dispatch messages (those with data.role).
+    // Direct messages to actor-* are handled entirely by SessionDispatcher.
+    // We only need to ensure the session exists before the dispatcher processes it.
     this.unsubDispatch = this.bus.subscribe<AIRequestMessage>("ai.request", (msg) => {
       if (!msg.target?.startsWith("actor-")) return;
-      const name = msg.target.replace("actor-", "");
       const dispatch = msg as ActorDispatchMessage;
       if (dispatch.data?.role) {
         this.handleDispatch(dispatch);
       } else {
-        // Direct message to actor — lazy-create session if it has saved state on disk
+        // Direct message to actor — lazy-create session if it has saved state on disk.
+        // SessionDispatcher will handle queuing and execution; we just ensure the session exists.
+        const name = msg.target.replace("actor-", "");
         const sessionId = `actor-${name}`;
         if (!this.sessions.has(sessionId)) {
-          // Check if there's a saved session on disk (persistent actor restored by pool)
           const savedSessions = this.sessions.listSaved("actor-");
           if (!savedSessions.includes(sessionId)) return;
-          // Resolve role from the meta sidecar so we don't silently downgrade
-          // persistent actors to the generic role on restart.
           const role = this.resolveActorRole(name);
           if (!role) {
             console.error(`[actor-runner] cannot resolve role for "${name}" and no generic fallback available`);
@@ -132,26 +128,6 @@ export class ActorRunnerPiece implements Piece {
           }
           this.getOrCreateSession(name, role);
         }
-        if (msg.source === "actor-pool" || msg.source === `actor-${name}`) return;
-        if (this.running.has(name)) {
-          // Queue the message for when the actor finishes. Emit pending_queue
-          // so the chat panel renders a queue card. NEVER emit prompt_dispatched
-          // here — that happens later, when drainQueue actually sends it.
-          if (!this.queues.has(name)) this.queues.set(name, []);
-          this.queues.get(name)!.push({ text: msg.text, replyTo: msg.replyTo, images: (msg as any).images });
-          this.broadcastPendingQueue(name);
-          return;
-        }
-        // Idle path — about to dispatch immediately. Emit prompt_dispatched
-        // so the chat panel renders the user entry NOW (mirrors
-        // JarvisCore's contract for owned sessions).
-        this.broadcastPromptDispatched(name, [{
-          text: msg.text,
-          source: msg.source,
-          images: (msg as any).images,
-        }]);
-        this.running.add(name);
-        this.runTask(name, msg.text, msg.replyTo, (msg as any).images).finally(() => this.drainQueue(name));
       }
     });
 
@@ -169,7 +145,6 @@ export class ActorRunnerPiece implements Piece {
   async stop(): Promise<void> {
     this.unsubDispatch?.();
     this.unsubKill?.();
-    this.queues.clear();
     // Close all actor sessions — ephemeral ones should NOT be saved
     for (const name of this.activeSessions) {
       const sessionId = `actor-${name}`;
@@ -180,7 +155,6 @@ export class ActorRunnerPiece implements Piece {
       this.sessions.close(sessionId);
     }
     this.activeSessions.clear();
-    this.running.clear();
   }
 
   private abortSession(name: string): void {
@@ -204,92 +178,22 @@ export class ActorRunnerPiece implements Piece {
 
   private handleDispatch(msg: ActorDispatchMessage): void {
     const name = msg.target!.replace("actor-", "");
-    const role = msg.data!.role;
+    const role = msg.data!.role as ActorRole;
     const replyTo = msg.replyTo;
     const task = msg.text;
     const images = (msg as any).images;
+
     this.getOrCreateSession(name, role);
-    if (this.running.has(name)) {
-      if (!this.queues.has(name)) this.queues.set(name, []);
-      this.queues.get(name)!.push({ text: task, replyTo, images });
-      this.broadcastPendingQueue(name);
-      return;
-    }
-    // Idle path — dispatching immediately. Emit prompt_dispatched so the
-    // chat panel renders the user entry NOW.
-    this.broadcastPromptDispatched(name, [{
+
+    // SessionDispatcher handles queuing and execution for all sessions including actor-*
+    this.bus.publish({
+      channel: "ai.request",
+      source: msg.source ?? "actor-pool",
+      target: msg.target!,
       text: task,
-      source: msg.source,
+      replyTo,
       images,
-    }]);
-    this.running.add(name);
-    this.runTask(name, task, replyTo, images, role).finally(() => this.drainQueue(name));
-  }
-
-  private async drainQueue(name: string): Promise<void> {
-    const queue = this.queues.get(name);
-    if (queue && queue.length > 0) {
-      const next = queue.shift()!;
-      // About to dispatch the queued message — emit prompt_dispatched so
-      // it migrates from QUEUED card to a `type:"user"` timeline entry,
-      // and refresh the pending_queue snapshot (one less item now).
-      this.broadcastPromptDispatched(name, [{
-        text: next.text,
-        source: "chat",
-        images: next.images,
-      }]);
-      this.broadcastPendingQueue(name);
-      this.runTask(name, next.text, next.replyTo, next.images).finally(() => this.drainQueue(name));
-    } else {
-      // Nothing left — mark as not running, broadcast empty queue so
-      // ChatPanel clears any lingering cards.
-      this.running.delete(name);
-      this.broadcastPendingQueue(name);
-    }
-  }
-
-  /**
-   * Emit `ai.stream` event `pending_queue` carrying a snapshot of the
-   * actor's queue. Mirrors JarvisCore.broadcastPendingQueue exactly so
-   * ChatPanel renders identical cards regardless of who owns the session.
-   * Text is truncated to 280 chars to keep the SSE payload small.
-   */
-  private broadcastPendingQueue(name: string): void {
-    const sessionId = `actor-${name}`;
-    const queue = this.queues.get(name) ?? [];
-    const items = queue.map(q => ({
-      text: (q.text ?? "").slice(0, 280),
-      source: "chat",
-      hasImages: !!q.images?.length,
-    }));
-    this.bus.publish({
-      channel: "ai.stream",
-      source: name,
-      target: sessionId,
-      event: "pending_queue",
-      items,
-    } as any);
-  }
-
-  /**
-   * Emit `ai.stream` event `prompt_dispatched` carrying the items that
-   * are about to be sent to the AI. ChatPiece expands each item into a
-   * `type:"user"` SSE entry. Mirrors JarvisCore.broadcastPromptDispatched
-   * — contract: a session owner emits this when a prompt actually goes
-   * to the model, which is the UX moment for the timeline entry.
-   */
-  private broadcastPromptDispatched(
-    name: string,
-    items: Array<{ text: string; source?: string; images?: any[] }>,
-  ): void {
-    if (items.length === 0) return;
-    const sessionId = `actor-${name}`;
-    this.bus.publish({
-      channel: "ai.stream",
-      source: name,
-      target: sessionId,
-      event: "prompt_dispatched",
-      items: items.map(i => ({ text: i.text, source: i.source, images: i.images })),
+      traceId: msg.traceId,
     } as any);
   }
 
@@ -357,202 +261,12 @@ export class ActorRunnerPiece implements Piece {
     }
   }
 
-  private async runTask(name: string, task: string, replyTo?: string, images?: any[], role?: ActorRole): Promise<void> {
-    const actorSessionId = `actor-${name}`;
-    if (!this.sessions.has(actorSessionId)) return;
-
-    // Fix B: callers via ai.request / drainQueue don't pass `role`.
-    // Resolve from the meta sidecar so post-task cleanup (e.g. autoKill)
-    // doesn't crash on `role.autoKill`. Warn if neither path yields a role.
-    if (!role) {
-      role = this.resolveActorRole(name) ?? undefined;
-      if (!role) {
-        console.warn(`[actor-runner] runTask("${name}"): role unresolved — autoKill check will be skipped`);
-      }
-    }
-
-    const managed = this.sessions.get(actorSessionId);
-    this.sessions.setState(actorSessionId, "processing");
-    this.publishStateChange(name, "running");
-
-    // Publish ai.request so context injectors (e.g. Mnemosyne retriever) can
-    // kick off their async fetch BEFORE sendAndStream is called. The injector
-    // awaits the pending fetch with a timeout, so the earlier we publish, the
-    // better the chance of a cache hit on the first turn.
-    this.bus.publish({
-      channel: "ai.request",
-      source: actorSessionId,
-      target: actorSessionId,
-      text: task,
-      data: { _preFetch: true },
-    });
-
-    let fullText = "";
-    let capabilityRounds = 0;
-    const imgBlocks = images?.map(i => ({ label: i.label, base64: i.base64, mediaType: i.mediaType }));
-    let stream = managed.session.sendAndStream(task, imgBlocks);
-
-    try {
-      while (true) {
-        const capabilityCalls: CapabilityCall[] = [];
-        fullText = "";
-
-        for await (const event of stream) {
-          if (!this.sessions.has(actorSessionId)) return; // killed mid-stream
-          switch (event.type) {
-            case "text_delta":
-              fullText += event.text ?? "";
-              this.bus.publish({
-                channel: "ai.stream",
-                source: name,
-                target: actorSessionId,
-                event: "delta",
-                text: event.text ?? "",
-              });
-              break;
-            case "tool_use":
-              if (event.toolUse) capabilityCalls.push(event.toolUse as CapabilityCall);
-              break;
-            case "retry":
-              // Transient API error → session is going to retry. Forward
-              // the retry banner over ai.stream so the actor's chat panel
-              // shows "Retrying (n/10, ~Xs)…" until the next text_delta
-              // (success) or terminal event.
-              if ((event as any).retry) {
-                this.bus.publish({
-                  channel: "ai.stream",
-                  source: name,
-                  target: actorSessionId,
-                  event: "retry",
-                  retry: (event as any).retry,
-                } as any);
-              }
-              break;
-            case "error":
-              if (event.error === "aborted") {
-                // User-initiated abort — not an error, stop gracefully
-                this.bus.publish({
-                  channel: "ai.stream",
-                  source: name,
-                  target: actorSessionId,
-                  event: "aborted",
-                });
-                this.publishStatus(name, "aborted");
-                this.sessions.setState(actorSessionId, "idle");
-                this.publishStateChange(name, "idle");
-                return;
-              }
-              this.bus.publish({
-                channel: "ai.stream",
-                source: name,
-                target: actorSessionId,
-                event: "error",
-                text: event.error ?? "Unknown error",
-              });
-              this.publishResult(name, `Error: ${event.error}`, replyTo);
-              this.sessions.setState(actorSessionId, "idle");
-              this.publishStateChange(name, "idle");
-              return;
-          }
-        }
-
-        if (!this.sessions.has(actorSessionId)) {
-          // Session was killed mid-loop (e.g. actor called actor_kill on itself).
-          // Still publish whatever text was accumulated so the result isn't lost.
-          if (fullText) this.publishResult(name, fullText, replyTo);
-          return;
-        }
-
-        if (capabilityCalls.length > 0) {
-          capabilityRounds++;
-          this.sessions.setState(actorSessionId, "waiting_tools");
-          this.publishStateChange(name, "waiting_tools");
-
-          for (const call of capabilityCalls) {
-            this.bus.publish({
-              channel: "ai.stream",
-              source: name,
-              target: actorSessionId,
-              event: "tool_start",
-              toolName: call.name,
-              toolId: call.id,
-              toolArgs: typeof call.input === "string" ? call.input : JSON.stringify(call.input).slice(0, 300),
-            });
-          }
-
-          // Inject sessionId so capabilities know the calling actor
-          const enrichedCalls = capabilityCalls.map(c => ({
-            ...c,
-            input: { ...(c.input as Record<string, unknown>), __sessionId: actorSessionId },
-          }));
-          const results: CapabilityResult[] = await this.ctx.capabilityRegistry.execute(enrichedCalls);
-
-          for (let i = 0; i < capabilityCalls.length; i++) {
-            const call = capabilityCalls[i];
-            const result = results[i];
-            const output = typeof result?.content === "string" ? result.content.slice(0, 300) : JSON.stringify(result).slice(0, 300);
-            this.bus.publish({
-              channel: "ai.stream",
-              source: name,
-              target: actorSessionId,
-              event: "tool_done",
-              toolName: call.name,
-              toolId: call.id,
-              toolOutput: output,
-            });
-          }
-
-          managed.session.addToolResults(capabilityCalls, results);
-          this.sessions.setState(actorSessionId, "processing");
-          this.publishStateChange(name, "running");
-          stream = managed.session.continueAndStream();
-          continue;
-        }
-
-        break;
-      }
-
-      // Complete — set idle (triggers auto-save)
-      this.sessions.setState(actorSessionId, "idle");
-      this.publishStateChange(name, "idle");
-
-      // Complete event for actor chat UI
-      this.bus.publish({
-        channel: "ai.stream",
-        source: name,
-        target: actorSessionId,
-        event: "complete",
-        text: fullText,
-      });
-
-      this.publishResult(name, fullText, replyTo);
-
-      // autoKill: one-shot roles (e.g. reader) clean themselves up after delivery.
-      // Fix A: defensive optional-chain in case role couldn't be resolved.
-      if (role?.autoKill) this.killSession(name);
-    } catch (err) {
-      this.sessions.setState(actorSessionId, "idle");
-      this.publishStateChange(name, "idle");
-      this.publishResult(name, `Crashed: ${err}`, replyTo);
-    }
-  }
-
   private publishStateChange(name: string, state: string): void {
     this.bus.publish({
       channel: "system.event",
       source: "actor-runner",
       event: "actor.state.change",
       data: { name, state },
-    });
-  }
-
-  private publishStatus(name: string, status: string): void {
-    // Notify actor-pool of status change (for UI tracking) without sending to main
-    this.bus.publish({
-      channel: "system.event",
-      source: "actor-runner",
-      event: "actor.dispatch.result",
-      data: { name, result: `[${status}]`, replyTo: "" },
     });
   }
 
@@ -566,7 +280,7 @@ export class ActorRunnerPiece implements Piece {
     });
 
     // Send result back to whoever requested it via ai.request
-    // JarvisCore will receive this as a new prompt and process it
+    // SessionDispatcher will receive this as a new prompt and process it
     if (replyTo) {
       this.bus.publish({
         channel: "ai.request",
@@ -583,8 +297,6 @@ export class ActorRunnerPiece implements Piece {
       this.sessions.clearSaved(sessionId);
     }
     this.sessions.close(sessionId);
-    this.queues.delete(name);
-    this.running.delete(name);
     this.activeSessions.delete(name);
     // Notify actor-pool to remove the actor from its registry
     this.bus.publish({
