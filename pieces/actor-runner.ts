@@ -137,7 +137,16 @@ export class ActorRunnerPiece implements Piece {
       if (msg.event === "actor.session.create") {
         const name = msg.data?.name as string;
         const role = msg.data?.role as ActorRole;
-        if (name && role) this.getOrCreateSession(name, role);
+        if (name && role) {
+          const managed = this.getOrCreateSession(name, role);
+          const systemPromptPreview = (managed.session as any).getSystemPrompt?.()?.slice(0, 120) ?? `Role: ${role.name}`;
+          this.bus.publish({
+            channel: "system.event",
+            source: this.id,
+            event: "actor.session.ready",
+            data: { name, sessionId: `actor-${name}`, role: role.id, systemPromptPreview },
+          });
+        }
       }
     });
   }

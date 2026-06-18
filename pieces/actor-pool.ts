@@ -324,42 +324,57 @@ export class ActorPoolPiece implements Piece {
         if (!newRole) return { ok: false, error: `Unknown role: ${roleId}. Available: ${this.roles.map(r => r.id).join(', ')}` };
 
         if (actor) {
-          if (actor.status === "running" || actor.status === "waiting_tools") {
-            return { ok: false, error: `Actor '${name}' is busy (${actor.status}).` };
-          }
-          actor.replyTo = sessionId;
-          // Update role if it changed — re-dispatch with a different role switches
-          // model + tool surface for subsequent tasks on the same session.
-          if (actor.role.id !== roleId) {
-            actor.role = newRole;
-          }
+          if (actor.role.id !== roleId) actor.role = newRole;
         } else {
           if (this.actors.size >= MAX_ACTORS) return { ok: false, error: `Pool full (${this.actors.size}/${MAX_ACTORS}).` };
-
           actor = { id: name, role: newRole, status: "idle", createdAt: Date.now(), taskCount: 0, replyTo: sessionId, chatHistory: [], persistent };
           this.actors.set(name, actor);
           this.syncPersistence(actor);
-          if (persistent) {
-            writeActorMeta(name, { roleId: newRole.id, persistent: true, createdAt: actor.createdAt });
-          }
+          if (persistent) writeActorMeta(name, { roleId: newRole.id, persistent: true, createdAt: actor.createdAt });
         }
 
-        actor.currentTask = task;
+        // Signal actor-runner to create/reuse the session with the correct role
+        // and system prompt. actor-runner replies with actor.session.ready carrying
+        // the confirmed sessionId + system prompt summary.
+        const ready = await new Promise<{ sessionId: string; role: string; systemPromptPreview: string }>((resolve) => {
+          const unsub = this.bus.subscribe<SystemEventMessage>("system.event", (msg) => {
+            if (msg.event === "actor.session.ready" && (msg.data as any)?.name === name) {
+              unsub();
+              resolve(msg.data as any);
+            }
+          });
+          this.bus.publish({
+            channel: "system.event",
+            source: this.id,
+            event: "actor.session.create",
+            data: { name, role: newRole },
+          });
+          // Safety timeout — 2s
+          setTimeout(() => { unsub(); resolve({ sessionId: `actor-${name}`, role: roleId, systemPromptPreview: "(timeout)" }); }, 2000);
+        });
+
+        // Now send the task via ai.request — SessionDispatcher processes it
         actor.chatHistory.push({ role: 'user', text: task, source: 'jarvis' });
-        actor.status = "running";
         actor.taskCount++;
+        actor.currentTask = task;
+        actor.replyTo = sessionId;
         this.updateHud();
 
         this.bus.publish({
           channel: "ai.request",
-          source: "jarvis-core",
-          target: "actor-" + name,
+          source: sessionId,
+          target: `actor-${name}`,
           replyTo: sessionId,
           text: task,
-          data: { name, role: actor.role },
         } as Parameters<EventBus["publish"]>[0]);
 
-        return { ok: true, actorId: name };
+        return {
+          ok: true,
+          actorId: name,
+          sessionId: ready.sessionId,
+          role: ready.role,
+          systemPromptPreview: ready.systemPromptPreview,
+        };
       }) as CapabilityHandler,
     });
 
