@@ -31,6 +31,7 @@ export class ActorRunnerPiece implements Piece {
   private started = false;
   private unsubDispatch?: () => void;
   private unsubKill?: () => void;
+  private unsubState?: () => void;
 
   constructor(ctx: PluginContext) {
     this.ctx = ctx;
@@ -149,11 +150,23 @@ export class ActorRunnerPiece implements Piece {
         }
       }
     });
+
+    // Bridge ai.stream session_state → actor.state.change so the actor-pool HUD
+    // can reflect live actor status (idle / processing / waiting_tools).
+    this.unsubState = this.bus.subscribe("ai.stream" as any, (msg: any) => {
+      if (msg.event !== "session_state") return;
+      const target: string = msg.target ?? "";
+      if (!target.startsWith("actor-")) return;
+      const name = target.replace("actor-", "");
+      if (!this.activeSessions.has(name)) return;
+      this.publishStateChange(name, msg.state ?? "idle");
+    });
   }
 
   async stop(): Promise<void> {
     this.unsubDispatch?.();
     this.unsubKill?.();
+    this.unsubState?.();
     // Close all actor sessions — ephemeral ones should NOT be saved
     for (const name of this.activeSessions) {
       const sessionId = `actor-${name}`;
